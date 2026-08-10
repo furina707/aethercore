@@ -1,0 +1,85 @@
+# 全协议代理核心 示例配置
+
+server:
+  listeners:
+    # HTTP 代理
+    - protocol: http
+      bind: "0.0.0.0:8080"
+    # HTTPS 代理（TLS 包装）
+    - protocol: https
+      bind: "0.0.0.0:8443"
+      tls: true
+    # SOCKS4/5 代理
+    - protocol: socks
+      bind: "0.0.0.0:1080"
+    # TCP 透明转发
+    - protocol: tcp
+      bind: "0.0.0.0:9999"
+    # UDP 透明转发
+    - protocol: udp
+      bind: "0.0.0.0:9998"
+    # DNS 代理
+    - protocol: dns
+      bind: "0.0.0.0:53"
+
+tls:
+  cert: "certs/server.crt"
+  key: "certs/server.key"
+  # client_ca: "certs/ca.crt"   # 启用双向认证时取消注释
+
+outbounds:
+  - name: direct
+    protocol: direct
+    target: "0.0.0.0:0"
+  # 经上游 SOCKS5 代理的链路
+  - name: via-socks5
+    protocol: socks5
+    target: "127.0.0.1:1088"
+  # 经上游 HTTP 代理的链路
+  - name: via-http
+    protocol: httpproxy
+    target: "127.0.0.1:3128"
+  # DNS 上游
+  - name: dns
+    protocol: direct
+    target: "8.8.8.8:53"
+
+routing:
+  # 匹配内网域名走直连
+  - name: "内网直连"
+    domain_suffix: ["internal.example.com", "corp.local"]
+    outbound: direct
+  # 特定端口走 SOCKS5 上游
+  - name: "特殊端口"
+    port: [22, 3389]
+    outbound: via-socks5
+  # 特定 CIDR 走 HTTP 上游
+  - name: "特定网段"
+    ip_cidr: ["192.168.0.0/16"]
+    outbound: via-http
+
+observability:
+  log_level: "info"
+  stats: true
+  stats_interval_secs: 10
+
+# 透明代理（Windows）：三种方案可单独启用
+transparent:
+  # 方案1：系统代理 / PAC 自动配置（用户态，无需管理员）
+  pac:
+    bind: "127.0.0.1:15080"
+    proxy: "PROXY 127.0.0.1:8080; SOCKS5 127.0.0.1:1080"
+    set_system_proxy: false
+    proxy_ports: [80, 443]
+    bypass_domains: ["internal.example.com", "corp.local"]
+  # 方案2：Wintun 虚拟网卡 TUN（需 wintun.dll + 管理员）
+  wintun:
+    dll_path: "wintun.dll"
+    adapter_name: "omni-proxy-tun"
+    subnet: "10.99.0.1/24"
+    redirect_port: 1080
+  # 方案3：WFP 重定向（内核级 TCP 透明重定向，需管理员 + callout 驱动）
+  wfp:
+    redirect_port: 1080
+    target_ports: [80, 443, 53]
+    bypass_ports: [8080, 8443, 1080, 53]

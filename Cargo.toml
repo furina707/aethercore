@@ -1,0 +1,49 @@
+[package]
+name = "omni-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "全协议代理核心 (TCP/UDP/HTTP/SOCKS/DNS + TLS + 规则路由)"
+
+[[bin]]
+name = "omni-proxy"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+rcgen = "0.13"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+bytes = "1"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+hickory-proto = "0.24"
+hickory-resolver = "0.24"
+arc-swap = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WindowsWebServices",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+] }
+
+[features]
+# 透明代理方案开关（Windows 专用）
+pac = []          # 方案1：系统代理 / PAC 自动配置
+wintun = []       # 方案2：Wintun 虚拟网卡 TUN 透明拦截
+wfp = []          # 方案3：WFP 重定向（TCP 透明重定向到本地端口）

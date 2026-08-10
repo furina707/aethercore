@@ -1,0 +1,18 @@
+# Rust build artifacts
+target/
+**/target/
+
+# Large ISO / disk images
+*.iso
+
+# Build / run logs
+*.log
+proxy.out
+proxy.err
+
+# RVM emulator outputs
+*.rvm
+
+# OS / editor
+.DS_Store
+Thumbs.db
