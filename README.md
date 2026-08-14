@@ -35,6 +35,7 @@
 | `launcher.py` | omni-proxy 零参数启动器 | `python launcher.py` |
 | `update_singbox.py` | 自动从 GitHub 下载适配当前平台的最新 sing-box 并更新 `core/singbox-core/`（自动备份旧版本；API 限流时回退直链） | `python update_singbox.py --check` 仅查询 / `python update_singbox.py` 更新 |
 | `singbox_docs.py` | 抓取 sing-box 官方配置要求，生成独立界面 `singbox-docs.html`（支持明暗主题；离线降级为内置快照） | `python singbox_docs.py` / `--offline` 强制离线 |
+| `proxy_gui.py` | **代理工具桌面 GUI**（PySide6/Qt）：一个窗口管理 omni-proxy（启停/实时统计/出站/路由）、sing-box（节点清单/启停/版本更新）与工具链（日志尾随/文档入口） | `pip install PySide6` 后 `python proxy_gui.py`；`--shot` 可无头渲染截图 |
 
 ---
 
