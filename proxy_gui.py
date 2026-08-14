@@ -437,8 +437,8 @@ def kpi_card(label: str) -> tuple[QFrame, QLabel]:
     lay.setSpacing(2)
     lay.addWidget(v)
     lay.addWidget(l)
-    # 不加 soften()：QGraphicsDropShadowEffect 在真实桌面会强制离屏渲染，
-    # 破坏 QSS，导致内容变白/不显示。卡片层次靠 QSS qlineargradient+border 实现。
+    # QFrame 单层绘制，QGraphicsDropShadowEffect 安全（QTableWidget 等复杂控件不行）
+    soften(frame, blur=22, dy=6, alpha=55)
     return frame, v
 
 
@@ -485,6 +485,7 @@ class OmniPage(QWidget):
         self.status_lb = QLabel("未连接（omni-proxy 未运行）")
         self.btn_start = QPushButton("启动 omni-proxy")
         self.btn_start.setObjectName("primary")
+        soften(self.btn_start, blur=24, dy=5, alpha=70)  # 主按钮投影（简单控件安全）
         self.btn_stop = QPushButton("停止")
         self.btn_stop.setObjectName("danger")
         self.btn_stop.setEnabled(False)
@@ -654,6 +655,7 @@ class SingboxPage(QWidget):
         self.status_lb = QLabel("未运行")
         self.btn_start = QPushButton("启动 sing-box")
         self.btn_start.setObjectName("primary")
+        soften(self.btn_start, blur=24, dy=5, alpha=70)
         self.btn_stop = QPushButton("停止")
         self.btn_stop.setObjectName("danger")
         self.btn_stop.setEnabled(False)
@@ -855,10 +857,12 @@ class MainWindow(QMainWindow):
         self._tray = None
         self._quit_requested = False
         self.setWindowTitle("代理工具控制台 · omni-proxy / sing-box")
-        self.resize(1180, 760)
+        # 默认窗口尺寸按主屏可用区比例计算（适配任意 DPI 缩放）
+        w, h = self._default_size()
+        self.resize(w, h)
         self.setObjectName("root")
 
-        # 恢复上次窗口几何
+        # 恢复上次窗口几何（若已记忆）
         geo = self._settings.value("geometry")
         if geo is not None:
             self.restoreGeometry(geo)
@@ -982,15 +986,25 @@ class MainWindow(QMainWindow):
 
     # ---------- 生命周期 ----------
 
+    def _default_size(self) -> tuple[int, int]:
+        """按主屏可用区比例计算默认窗口尺寸（任意 DPI 下都适中）。"""
+        scr = QGuiApplication.primaryScreen()
+        if scr is not None:
+            avail = scr.availableGeometry()
+            w = int(avail.width() * 0.82)
+            h = int(avail.height() * 0.86)
+            return max(w, 980), max(h, 640)
+        return 1180, 760
+
     def showEvent(self, ev):
         """显示时按屏幕可用区与 DPI 校正窗口尺寸，并展示缩放信息。"""
         super().showEvent(ev)
         scr = self.screen()
         if scr is not None:
-            # 逻辑像素窗口尺寸超出屏幕可用区时收缩到 92%（高 DPI 屏幕常见）
+            # 逻辑坐标下窗口超出屏幕可用区时收缩到 90%（高 DPI / 小屏常见）
             avail = scr.availableGeometry()
             if self.width() > avail.width() or self.height() > avail.height():
-                self.resize(int(avail.width() * 0.92), int(avail.height() * 0.92))
+                self.resize(int(avail.width() * 0.90), int(avail.height() * 0.90))
         dpr = self.devicePixelRatioF()
         self.statusBar().showMessage(
             f"工作目录：{ROOT} · Web 控制台：http://127.0.0.1:9090 · 显示缩放 {dpr:.2f}×"
