@@ -656,9 +656,13 @@ class SingboxPage(QWidget):
         self.btn_stop.setEnabled(False)
         self.btn_update = QPushButton("检查/更新版本")
         self.btn_update.setObjectName("ghost")
+        self.btn_sub = QPushButton("更新订阅")
+        self.btn_sub.setObjectName("ghost")
+        self.btn_sub.setToolTip("从 sub 订阅地址拉取最新节点并生成 singbox-config.json")
         top.addWidget(self.status_dot)
         top.addWidget(self.status_lb)
         top.addStretch(1)
+        top.addWidget(self.btn_sub)
         top.addWidget(self.btn_update)
         top.addWidget(self.btn_stop)
         top.addWidget(self.btn_start)
@@ -678,6 +682,7 @@ class SingboxPage(QWidget):
         self.btn_start.clicked.connect(self.start_singbox)
         self.btn_stop.clicked.connect(self.stop_singbox)
         self.btn_update.clicked.connect(self.check_update)
+        self.btn_sub.clicked.connect(self.update_sub)
         self.refresh_nodes()
 
         self.timer = QTimer(self)
@@ -730,7 +735,7 @@ class SingboxPage(QWidget):
         self.status_lb.setText("未运行")
         tray_notify("sing-box", "已停止")
 
-    def _run_script(self, args: list[str]):
+    def _run_script(self, args: list[str], on_done=None):
         self.out.clear()
         self.out.appendPlainText("$ python " + " ".join(args))
         script = ROOT / args[0]
@@ -738,16 +743,31 @@ class SingboxPage(QWidget):
         def worker():
             try:
                 p = subprocess.run([sys.executable, str(script)] + args[1:],
-                                   capture_output=True, text=True, timeout=120, cwd=str(ROOT))
+                                   capture_output=True, text=True, timeout=300, cwd=str(ROOT))
                 text = (p.stdout or "") + (p.stderr or "")
             except Exception as e:
                 text = str(e)
             self.out.appendPlainText(text)
+            if on_done is not None:
+                # 跨线程安全：绑定方法会在主线程队列执行
+                QTimer.singleShot(0, on_done)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def check_update(self):
         self._run_script(["update_singbox.py", "--check"])
+
+    def update_sub(self):
+        self.btn_sub.setEnabled(False)
+        self.btn_sub.setText("更新中…")
+
+        def done():
+            self.btn_sub.setEnabled(True)
+            self.btn_sub.setText("更新订阅")
+            self.refresh_nodes()
+            tray_notify("sing-box", "订阅更新完成，节点清单已刷新")
+
+        self._run_script(["update_subscription.py"], on_done=done)
 
     def closeEvent(self, ev):
         self.timer.stop()
