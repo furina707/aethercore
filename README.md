@@ -16,8 +16,8 @@
 - 启动方式：
   - 开发调试：`cd core/proxy-core && cargo run -- proxy-config.json`
   - 生产（零参数）：`python launcher.py`（自动定位编译产物并传入配置）
-- 当前能力：HTTP/HTTPS/SOCKS4-5/DNS + TLS + 规则路由 + 配置热重载 + 健康检查故障转移 + PAC 透明代理。
-- 状态：v0.1.0，MVP 完成度较高；Wintun/WFP 透明代理、SOCKS5 UDP、Shadowsocks/Vmess 出站仍处部分/待实现。
+- 当前能力：HTTP/HTTPS/SOCKS4-5/DNS + TLS + 规则路由 + 配置热重载 + 健康检查故障转移 + PAC/Wintun 透明代理 + 内置 UAC 提权。
+- 状态：v0.1.0，MVP 完成度较高；WFP 透明代理、SOCKS5 UDP、Shadowsocks/Vmess 出站仍处部分/待实现。
 
 ## 2. sing-box（预编译二进制）
 
@@ -25,6 +25,16 @@
 - 配置：`singbox-config.json`（由订阅地址 `sub` 生成，含节点清单与凭证，**不入库**）
 - 启动：`core/singbox-core/sing-box.exe run -c singbox-config.json`
 - 说明：成熟的第三方代理实现，按需选用，与 omni-proxy 无代码耦合。
+
+---
+
+## 3. 工具脚本
+
+| 脚本 | 作用 | 用法 |
+|---|---|---|
+| `launcher.py` | omni-proxy 零参数启动器 | `python launcher.py` |
+| `update_singbox.py` | 自动从 GitHub 下载适配当前平台的最新 sing-box 并更新 `core/singbox-core/`（自动备份旧版本；API 限流时回退直链） | `python update_singbox.py --check` 仅查询 / `python update_singbox.py` 更新 |
+| `singbox_docs.py` | 抓取 sing-box 官方配置要求，生成独立界面 `singbox-docs.html`（支持明暗主题；离线降级为内置快照） | `python singbox_docs.py` / `--offline` 强制离线 |
 
 ---
 
