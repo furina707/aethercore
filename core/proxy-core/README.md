@@ -52,6 +52,12 @@
 - **方案 2 — Wintun TUN**：动态加载 `wintun.dll` 创建虚拟网卡捕获流量，用户态自研最小 TCP 状态机 + UDP NAT 做 L3/L4 终止，桥接出站链路（需管理员 + DLL）
 - **方案 3 — WFP**：内核级 TCP 透明重定向（需管理员 + callout 驱动，当前为脚手架）
 
+### 内置提权（Windows）
+启动时**总是检测**管理员权限：非管理员时经独立提权辅助程序 `omni-elevater.exe`
+（UAC `runas` 动词）以管理员身份重启自身并透传原始参数，全程只弹一次 UAC；
+用户取消或辅助程序缺失时自动降级以当前权限运行。开发/CI 可用 `--no-elevate`
+参数或环境变量 `OMNI_NO_ELEVATE=1` 跳过提权。
+
 ## 快速开始
 
 ### 编译
@@ -101,6 +107,7 @@ omni-proxy — 全协议代理核心 (TCP/UDP/HTTP/SOCKS/DNS + TLS + 规则路�
 选项:
     -c, --config <PATH>      配置文件路径（默认: proxy-config.json）
         --check <PATH>       仅校验配置文件合法性，不启动服务
+        --no-elevate         跳过 UAC 提权（内置提权工具，供开发/CI 使用）
     -v, --verbose            提升日志级别到 debug（覆盖配置）
     -q, --quiet              降低日志级别到 warn（覆盖配置）
     -h, --help               显示此帮助信息
@@ -165,11 +172,14 @@ src/
 ├── dns.rs               DNS 代理：UDP 查询转发
 ├── tls.rs               rustls 服务端/客户端配置，支持 mTLS
 ├── observe.rs           可观测性：日志、全局统计、per-outbound 统计
+├── elevate.rs           Windows 内置提权：启动检测管理员，UAC 重启（配合 src/bin/elevater.rs）
 └── transparent/         Windows 透明代理
     ├── mod.rs           统一入口
     ├── pac.rs           方案 1：PAC 自动配置
     ├── wintun_tun.rs    方案 2：Wintun 虚拟网卡 TUN
-    └── wfp.rs           方案 3：WFP 重定向（脚手架）
+    └── wfp.rs           方案 3：WFP 重定向（骨架）
+src/bin/
+└── elevater.rs          独立提权辅助程序（omni-elevater.exe）
 examples/
 └── gen_cert.rs          生成自签名证书
 ```
@@ -195,6 +205,7 @@ cargo test --bin omni-proxy
 - **WFP 重定向**：两种落地方式——(1) WFP 内建 ALE_REDIRECT（纯用户态，无需自研驱动，推荐）；(2) 自定义 Callout 驱动 `omni-proxy-wfp.sys`（完全控制）。当前 `wfp.rs` 仅提供用户态管理引擎骨架，两种方式均未完整实现，需配套 WFP 管理 API 调用；生产可用请优先选方案1(PAC) 或方案2(Wintun)
 - **连接池**：`outbound.pool_size` 字段已定义但未启用（每次新建连接）
 - **HTTP 转发**：响应体仅处理 `Content-Length` 与 `Transfer-Encoding: chunked`，`Connection: close` 模式按读到 EOF 处理
+- **UAC 提权**：提权后新实例会新开控制台窗口（UAC 语义）；若用户取消 UAC 或缺失 `omni-elevater.exe`，则以当前权限降级运行
 
 ## 依赖
 

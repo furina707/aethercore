@@ -2,6 +2,7 @@
 mod cli;
 mod config;
 mod dns;
+mod elevate;
 mod http;
 mod observe;
 mod relay;
@@ -32,6 +33,12 @@ async fn main() -> Result<()> {
             "进入配置校验模式（不启动服务）"
         );
         return run_check(&args.config);
+    }
+
+    // 内置提权工具：启动时总是检测管理员权限；非管理员且未跳过时，
+    // 经 omni-elevater 以管理员身份重启（返回 true 表示已触发提权，本进程退出）。
+    if elevate::ensure_elevated_or_relaunch(&args)? {
+        return Ok(());
     }
 
     // 安装 Ctrl+C / SIGTERM 信号处理，触发优雅退出

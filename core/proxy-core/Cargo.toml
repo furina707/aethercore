@@ -8,6 +8,10 @@ description = "全协议代理核心 (TCP/UDP/HTTP/SOCKS/DNS + TLS + 规则路�
 name = "omni-proxy"
 path = "src/main.rs"
 
+[[bin]]
+name = "omni-elevater"
+path = "src/bin/elevater.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
@@ -51,6 +55,7 @@ windows = { version = "0.52", features = [
     "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_Rpc",
+    "Win32_UI_Shell",
 ] }
 
 [features]

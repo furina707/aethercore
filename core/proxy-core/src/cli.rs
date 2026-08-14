@@ -24,6 +24,8 @@ pub struct CliArgs {
     pub check_only: bool,
     /// 日志级别覆盖：None=使用配置；Some("debug")/Some("warn") 等=覆盖
     pub log_level_override: Option<String>,
+    /// 跳过 UAC 提权（内置提权工具；开发/CI 或无需管理员权限时使用）
+    pub no_elevate: bool,
 }
 
 impl Default for CliArgs {
@@ -32,6 +34,7 @@ impl Default for CliArgs {
             config: "proxy-config.json".to_string(),
             check_only: false,
             log_level_override: None,
+            no_elevate: false,
         }
     }
 }
@@ -50,6 +53,7 @@ const HELP_TEXT: &str = r#"omni-proxy — 全协议代理核心 (TCP/UDP/HTTP/SO
 选项:
     -c, --config <PATH>      配置文件路径（默认: proxy-config.json）
         --check <PATH>       仅校验配置文件合法性，不启动服务
+        --no-elevate         跳过 UAC 提权（内置提权工具，供开发/CI 使用）
     -v, --verbose            提升日志级别到 debug（覆盖配置）
     -q, --quiet              降低日志级别到 warn（覆盖配置）
     -h, --help               显示此帮助信息
@@ -97,6 +101,10 @@ pub fn parse_from(args: &[String]) -> CliArgs {
             }
             "-q" | "--quiet" => {
                 quiet = true;
+                i += 1;
+            }
+            "--no-elevate" => {
+                out.no_elevate = true;
                 i += 1;
             }
             "-c" | "--config" => {
@@ -224,5 +232,13 @@ mod tests {
         // 同时指定 -q -v 时 verbose 优先
         let a = parse_from(&["-q".to_string(), "-v".to_string()]);
         assert_eq!(a.log_level_override.as_deref(), Some("debug"));
+    }
+
+    #[test]
+    fn parses_no_elevate() {
+        let a = parse_from(&["--no-elevate".to_string()]);
+        assert!(a.no_elevate);
+        let b = parse_from(&[]);
+        assert!(!b.no_elevate);
     }
 }
