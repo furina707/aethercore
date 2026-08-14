@@ -586,9 +586,11 @@ class OmniPage(QWidget):
             v.setText("—")
 
     def poll(self):
+        # omni-proxy 未运行 → fallback 演示数据，保证打开就有完整设计稿数据展示，
+        # 避免空状态被误判为"显示异常"。启动 omni 后自动切真实数据。
         data = fetch_status(WEBUI_URL) if not self.demo else DEMO_STATUS
         if data is None:
-            self.set_offline()
+            self.render(DEMO_STATUS, True)  # fallback 演示模式（不是空状态）
             return
         # 启动中 → 就绪 状态迁移
         if self.btn_start.text() == "启动中…":
@@ -597,12 +599,18 @@ class OmniPage(QWidget):
         self.render(data, False)
 
     def render(self, d: dict, demo: bool):
-        self.status_dot.setStyleSheet("color:#34d399;font-size:16px;")
-        self.status_lb.setText(
-            f"已连接 · v{d.get('version','?')} · 热重载 "
-            f"{d['config'].get('hot_reload_secs') or '关'}s · 健康检查 "
-            f"{'开' if d['config'].get('health_check_enabled') else '关'}"
-            + ("  · [演示数据]" if demo else ""))
+        # 状态点：演示模式用紫色（明显区分），真实模式用绿色
+        dot_color = "#a78bfa" if demo else "#34d399"
+        self.status_dot.setStyleSheet(f"color:{dot_color};font-size:16px;")
+        if demo:
+            self.status_lb.setText(
+                f"演示数据模式（omni-proxy 未运行）· v{d.get('version','?')} · "
+                f"启动后自动切换为实时数据")
+        else:
+            self.status_lb.setText(
+                f"已连接 · v{d.get('version','?')} · 热重载 "
+                f"{d['config'].get('hot_reload_secs') or '关'}s · 健康检查 "
+                f"{'开' if d['config'].get('health_check_enabled') else '关'}")
         st = d["stats"]
         vals = [str(st["total_connections"]), str(st["active_connections"]),
                 st["bytes_in_human"], st["bytes_out_human"], str(st["errors"]),
