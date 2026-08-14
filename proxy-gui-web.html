@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>代理工具控制台 · UI 调试版</title>
+<style>
+/* ============ 与 proxy_gui.py QSS 一致的色板（暗色） ============ */
+:root{
+  --bg0:#080b14; --bg1:#0e1424;
+  --ink:#e8edf8; --sub:#94a0ba; --weak:#67748f;
+  --card:rgba(255,255,255,0.05);
+  --card-hi:rgba(255,255,255,0.085);
+  --line:rgba(255,255,255,0.10);
+  --line-hi:rgba(125,140,255,0.40);
+  --accent:#7d8cff; --accent-grad:linear-gradient(135deg,#6366f1,#8b5cf6);
+  --green:#34d399; --amber:#fbbf24; --red:#fb7185;
+  --table-bg:rgba(10,14,26,0.55);
+  --shadow:0 10px 30px rgba(0,0,0,0.45);
+  --shadow-sm:0 4px 14px rgba(0,0,0,0.30);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  font-family:Inter,"Segoe UI",-apple-system,"Microsoft YaHei UI","PingFang SC","Microsoft YaHei",sans-serif;
+  font-size:13px; color:var(--ink); line-height:1.65; min-height:100vh;
+  background:
+    radial-gradient(900px 480px at 12% -8%, rgba(99,102,241,0.18), transparent 60%),
+    radial-gradient(820px 460px at 95% 0%, rgba(34,211,238,0.10), transparent 55%),
+    linear-gradient(168deg, var(--bg0), var(--bg1));
+  background-attachment:fixed;
+  padding:18px; overflow:hidden;
+}
+.app{display:flex; gap:16px; height:calc(100vh - 36px);}
+
+/* ============ 导航 ============ */
+.nav{
+  width:180px; flex:none; display:flex; flex-direction:column; gap:8px;
+  background:linear-gradient(180deg, rgba(255,255,255,0.055), rgba(255,255,255,0.025));
+  border:1px solid var(--line); border-radius:14px; padding:10px 8px;
+  box-shadow:var(--shadow-sm);
+}
+.brand{display:flex; align-items:center; gap:9px; padding:4px 8px 12px; border-bottom:1px solid rgba(255,255,255,0.07); margin-bottom:6px}
+.brand .logo{
+  width:32px;height:32px;border-radius:9px;flex:none; background:var(--accent-grad);
+  display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px;color:#fff;
+  box-shadow:0 4px 12px rgba(99,102,241,0.4);
+}
+.brand b{font-size:13.5px;letter-spacing:.2px}
+.brand span{display:block;font-size:10.5px;color:var(--weak);font-weight:400}
+.nav .item{
+  border-radius:9px; padding:9px 12px; color:#a9b4cd; cursor:pointer;
+  transition:background .15s, color .15s; font-weight:500; user-select:none;
+}
+.nav .item:hover{background:rgba(255,255,255,0.06)}
+.nav .item.active{
+  background:var(--accent-grad); color:#fff; font-weight:700;
+  box-shadow:0 4px 14px rgba(99,102,241,0.35);
+}
+.nav .spacer{flex:1}
+.nav .hint{font-size:10.5px; color:var(--weak); padding:4px 8px}
+
+/* ============ 主区 ============ */
+.main{flex:1; min-width:0; display:flex; flex-direction:column; gap:14px; overflow-y:auto; padding:2px 4px 12px}
+.panel{display:none; flex-direction:column; gap:14px; min-height:100%}
+.panel.on{display:flex}
+
+/* ============ 卡片 ============ */
+.card{
+  background:linear-gradient(180deg, rgba(255,255,255,0.075), rgba(255,255,255,0.035));
+  border:1px solid var(--line); border-radius:14px; padding:16px 18px;
+  box-shadow:var(--shadow-sm); transition:border-color .15s, transform .15s;
+}
+.card:hover{border-color:rgba(125,140,255,0.30)}
+.sec-title{font-size:14.5px; font-weight:700; padding-left:11px; border-left:3px solid var(--accent-grad); margin-bottom:12px; letter-spacing:.3px}
+.muted{color:var(--sub); font-size:12px}
+
+/* ============ 顶部状态条 ============ */
+.topbar{display:flex; align-items:center; gap:12px; flex-wrap:wrap}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 1.6s ease infinite}
+.dot.gray{background:#64748b;box-shadow:none;animation:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.topbar .status{font-size:12.5px; color:var(--sub)}
+.topbar .spacer{flex:1}
+.topbar .version{font-size:11px; color:var(--weak); margin-right:4px}
+
+/* ============ 按钮 ============ */
+.btn{
+  background:rgba(125,140,255,0.13); color:#d4dbff;
+  border:1px solid rgba(125,140,255,0.32); border-radius:9px;
+  padding:7px 16px; font-weight:600; font-size:12.5px; cursor:pointer;
+  transition:background .15s, border-color .15s, transform .1s; user-select:none;
+}
+.btn:hover{background:rgba(125,140,255,0.24); border-color:rgba(125,140,255,0.48)}
+.btn:active{transform:translateY(1px)}
+.btn.primary{
+  background:var(--accent-grad); color:#fff; font-weight:700; letter-spacing:.3px;
+  border:1px solid rgba(255,255,255,0.18);
+  box-shadow:0 4px 14px rgba(99,102,241,0.35);
+}
+.btn.primary:hover{filter:brightness(1.12)}
+.btn.danger{background:rgba(251,113,133,0.12); border-color:rgba(251,113,133,0.38); color:#fda4af}
+.btn.danger:hover{background:rgba(251,113,133,0.24)}
+.btn.ghost{background:transparent; border-color:rgba(255,255,255,0.14); color:#b6c0d6}
+.btn.ghost:hover{background:rgba(255,255,255,0.06); border-color:rgba(255,255,255,0.24)}
+.btn:disabled{color:#4d5870; border-color:rgba(255,255,255,0.06); background:transparent; cursor:default}
+
+/* ============ KPI ============ */
+.kpis{display:grid; grid-template-columns:repeat(auto-fit, minmax(150px,1fr)); gap:12px}
+.kpi{
+  background:linear-gradient(180deg, rgba(255,255,255,0.075), rgba(255,255,255,0.035));
+  border:1px solid var(--line); border-radius:13px; padding:13px 15px;
+  box-shadow:var(--shadow-sm); transition:transform .15s, border-color .15s;
+}
+.kpi:hover{transform:translateY(-2px); border-color:rgba(125,140,255,0.35)}
+.kpi .v{font-size:23px; font-weight:800; color:var(--accent); letter-spacing:.2px}
+.kpi .l{font-size:11px; color:var(--sub); margin-top:2px; letter-spacing:.3px}
+
+/* ============ 表格 ============ */
+.split{display:grid; grid-template-columns:7fr 3fr; gap:14px}
+@media(max-width:1000px){.split{grid-template-columns:1fr}}
+.topbar .status{font-size:12.5px; color:var(--sub); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; flex:1}
+table th,table td{padding:8px 11px}
+table th{font-size:11px; white-space:nowrap; letter-spacing:.2px}
+table tbody td{white-space:nowrap}
+table .col-narrow{min-width:54px}
+.ob-name{min-width:120px; word-break:break-all; color:var(--ink)}
+table{width:100%; border-collapse:separate; border-spacing:0; font-size:12.5px;
+  background:var(--table-bg); border:1px solid var(--line); border-radius:12px; overflow:hidden;
+  box-shadow:var(--shadow-sm)}
+th,td{text-align:left; padding:8px 11px; border-bottom:1px solid rgba(255,255,255,0.06)}
+tr:last-child td{border-bottom:none}
+th{color:#8f9bb6; font-weight:600; font-size:11.5px; letter-spacing:.3px;
+  background:linear-gradient(180deg, rgba(255,255,255,0.07), rgba(255,255,255,0.03))}
+tbody tr{transition:background .12s}
+tbody tr:hover{background:rgba(255,255,255,0.055)}
+td b{color:var(--ink)}
+code{background:rgba(255,255,255,0.08); border:1px solid var(--line); border-radius:6px; padding:1px 7px; font-size:11.5px; color:#c9d4ec; font-family:Consolas,"Cascadia Mono",monospace}
+.chip{display:inline-block; background:rgba(255,255,255,0.06); border:1px solid var(--line); border-radius:999px; padding:1px 8px; font-size:10.5px; margin:1px 3px 1px 0; color:var(--sub)}
+.hl{display:inline-flex; align-items:center; gap:6px; font-size:12px}
+.hl .dot{width:8px;height:8px; animation:none}
+.ok{color:var(--green); font-weight:600}
+.bad{color:var(--red); font-weight:600}
+.empty{color:var(--weak); font-size:12px; padding:6px 2px}
+
+/* ============ 输出区/日志 ============ */
+.console{
+  background:rgba(7,11,22,0.9); border:1px solid var(--line); border-radius:12px;
+  font-family:Consolas,"Cascadia Mono",monospace; font-size:11.5px; color:#c9d4ec;
+  padding:12px 14px; min-height:80px; max-height:150px; overflow-y:auto; white-space:pre-wrap;
+  box-shadow:var(--shadow-sm);
+}
+.log{flex:1; min-height:0; max-height:none; resize:none}
+
+/* ============ 滚动条 ============ */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.14); border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,0.24)}
+::selection{background:rgba(125,140,255,0.35)}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- ===== 导航 ===== -->
+  <aside class="nav">
+    <div class="brand">
+      <div class="logo">om</div>
+      <b>代理工具<span>omni-proxy / sing-box</span></b>
+    </div>
+    <div class="item active" data-tab="omni">omni-proxy 核心</div>
+    <div class="item" data-tab="singbox">sing-box 节点</div>
+    <div class="item" data-tab="tools">工具链</div>
+    <div class="spacer"></div>
+    <div class="hint">Ctrl+1 / 2 / 3 切换</div>
+  </aside>
+
+  <!-- ===== 主区 ===== -->
+  <main class="main">
+
+    <!-- ===== omni-proxy 页 ===== -->
+    <section class="panel on" id="panel-omni">
+      <div class="card">
+        <div class="topbar">
+          <span class="dot"></span>
+          <span class="status" id="omni-status">已连接 · v0.1.0 · 热重载 5s · 健康检查 开 · [演示数据]</span>
+          <span class="version">显示缩放 1.00×</span>
+          <span class="spacer"></span>
+          <button class="btn ghost">立即刷新</button>
+          <button class="btn danger">停止</button>
+          <button class="btn primary">启动 omni-proxy</button>
+        </div>
+      </div>
+      <div class="kpis" id="kpis"></div>
+      <div class="split">
+        <div class="card">
+          <div class="sec-title">出站链路</div>
+          <table><thead><tr><th>名称</th><th>协议</th><th>目标</th><th>健康</th><th>连接</th><th>活跃</th><th>错误</th><th>↑</th><th>↓</th></tr></thead>
+          <tbody id="ob-body"></tbody></table>
+        </div>
+        <div class="card">
+          <div class="sec-title">监听器</div>
+          <table><thead><tr><th>协议</th><th>绑定地址</th></tr></thead>
+          <tbody id="ls-body"></tbody></table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="sec-title">路由规则</div>
+        <table><thead><tr><th>名称</th><th>匹配</th><th>模式</th><th>出口</th></tr></thead>
+        <tbody id="rt-body"></tbody></table>
+      </div>
+    </section>
+
+    <!-- ===== sing-box 页 ===== -->
+    <section class="panel" id="panel-singbox">
+      <div class="card">
+        <div class="topbar">
+          <span class="dot gray"></span>
+          <span class="status" id="sb-status">未运行 · 42 个节点 · [演示数据]</span>
+          <span class="spacer"></span>
+          <button class="btn ghost">更新订阅</button>
+          <button class="btn ghost">检查/更新版本</button>
+          <button class="btn danger">停止</button>
+          <button class="btn primary">启动 sing-box</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="sec-title">节点清单（singbox-config.json）</div>
+        <table><thead><tr><th>节点</th><th>协议</th><th>服务器</th><th>端口</th></tr></thead>
+        <tbody id="node-body"></tbody></table>
+      </div>
+      <div class="card">
+        <div class="sec-title">更新输出</div>
+        <div class="console" id="sb-out">$ python update_subscription.py
+[sub] 下载订阅：https://dash.pqjc.site/api/v1/pq/…
+[sub] 解析完成：30 个节点（去重后）
+[sub] 类型分布: vless×30
+[sub] 完成：singbox-config.json（30 个节点 + 自动选择/节点选择）</div>
+      </div>
+    </section>
+
+    <!-- ===== 工具链页 ===== -->
+    <section class="panel" id="panel-tools">
+      <div class="card">
+        <div class="sec-title">入口</div>
+        <div class="topbar" style="flex-wrap:wrap">
+          <button class="btn ghost">sing-box 官方配置要求（本地界面）</button>
+          <button class="btn ghost">官方文档（在线）</button>
+          <button class="btn ghost">开发进度报告</button>
+          <button class="btn ghost">打开日志目录</button>
+        </div>
+      </div>
+      <div class="card" style="display:flex;flex-direction:column;flex:1">
+        <div class="sec-title">omni-proxy 日志（自动尾随）
+          <label style="float:right;font-size:12px;color:var(--sub);font-weight:400;border-left:none;padding:0">
+            <input type="checkbox" checked style="accent-color:#7d8cff;vertical-align:-2px"> 自动滚动到底部
+          </label>
+        </div>
+        <div class="console log" id="tools-log">2026-08-14T23:10:02Z INFO 全协议代理核心启动 version=0.1.0
+2026-08-14T23:10:02Z INFO 配置已加载，准备启动服务 listeners=6 outbounds=4 routes=3 hot_reload_secs=5s health_check=true tls=true
+2026-08-14T23:10:02Z INFO Web 控制台已启动，浏览器打开 http://127.0.0.1:9090
+2026-08-14T23:10:02Z INFO 开始启动监听器 count=6
+2026-08-14T23:10:03Z INFO 健康检查任务已启动
+2026-08-14T23:10:05Z INFO proxy stats total=1284 active=7 in_mb=498 out_mb=1148 errors=3
+2026-08-14T23:10:15Z INFO proxy stats total=1301 active=5 in_mb=512 out_mb=1190 errors=3</div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+/* ===== mock 数据（与 proxy_gui.py DEMO_STATUS 一致）===== */
+var DEMO_STATUS = {
+  version:"0.1.0",
+  stats:{total_connections:1284,active_connections:7,bytes_in:523000000,bytes_out:1204000000,bytes_in_human:"498.78 MB",bytes_out_human:"1.12 GB",errors:3,uptime_secs:90042},
+  outbounds:[
+    {name:"direct",protocol:"direct",target:"0.0.0.0:0",alive:true,failures:0,connections:820,active:2,errors:0,bytes_up:210000000,bytes_down:640000000},
+    {name:"via-socks5",protocol:"socks5",target:"127.0.0.1:1088",alive:true,failures:0,connections:410,active:5,errors:1,bytes_up:300000000,bytes_down:550000000},
+    {name:"dns",protocol:"direct",target:"8.8.8.8:53",alive:false,failures:3,connections:54,active:0,errors:2,bytes_up:13000000,bytes_down:14000000}
+  ],
+  listeners:[
+    {protocol:"http",bind:"0.0.0.0:8080"},{protocol:"https",bind:"0.0.0.0:8443"},
+    {protocol:"socks",bind:"0.0.0.0:1080"},{protocol:"dns",bind:"0.0.0.0:53"}
+  ],
+  routes:[
+    {name:"内网直连",domain_suffix:["internal.example.com","corp.local"],ip_cidr:[],port:[],match_mode:"any",outbound:"direct"},
+    {name:"SSH/RDP 走 SOCKS5",domain_suffix:[],ip_cidr:[],port:[22,3389],match_mode:"any",outbound:"via-socks5"},
+    {name:"内网网段",domain_suffix:[],ip_cidr:["192.168.0.0/16","10.0.0.0/8"],port:[],match_mode:"any",outbound:"direct"}
+  ],
+  config:{hot_reload_secs:5,health_check_enabled:true,log_level:"info",stats_interval_secs:10,idle_timeout_secs:300}
+};
+var DEMO_NODES=[
+  {tag:"🇸🇬狮城节点",type:"vless",server:"sg1.example.com",port:443},
+  {tag:"🇯🇵日本东京01",type:"vless",server:"jp1.example.com",port:443},
+  {tag:"🇭🇰香港01",type:"vless",server:"hk1.example.com",port:8443},
+  {tag:"🇺🇸美国01",type:"hysteria2",server:"us1.example.com",port:35000},
+  {tag:"🇺🇸美国02",type:"shadowsocks",server:"us2.example.com",port:8388},
+  {tag:"🇸🇬新加坡02",type:"vless",server:"sg2.example.com",port:443}
+];
+
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+function fmtBytes(b){b=Number(b)||0;if(b<1024)return b+" B";var u=["KB","MB","GB","TB"],i=-1;do{b/=1024;i++;}while(b>=1024&&i<u.length-1);return b.toFixed(2)+" "+u[i];}
+function fmtUptime(s){s=Number(s)||0;var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return (h<10?"0":"")+h+":"+(m<10?"0":"")+m+":"+(x<10?"0":"")+x;}
+
+function renderOmni(d){
+  var st=d.stats;
+  document.getElementById("kpis").innerHTML=[
+    ["总连接",st.total_connections],["活跃连接",st.active_connections],["上传",st.bytes_in_human],
+    ["下载",st.bytes_out_human],["错误",st.errors],["运行时长",fmtUptime(st.uptime_secs)]
+  ].map(function(k){return '<div class="kpi"><div class="v">'+k[1]+'</div><div class="l">'+k[0]+'</div></div>';}).join("");
+  document.getElementById("ob-body").innerHTML=d.outbounds.map(function(o){
+    var h='<span class="hl"><span class="dot" style="background:'+(o.alive?"var(--green)":"var(--red)")+';box-shadow:none"></span>'+(o.alive?'<span class="ok">正常</span>':'<span class="bad">失效×'+o.failures+"</span>")+'</span>';
+    return "<tr><td class='ob-name'><b>"+esc(o.name)+"</b></td><td><code>"+esc(o.protocol)+"</code></td><td>"+esc(o.target)+"</td><td>"+h+"</td><td class='col-narrow'>"+o.connections+"</td><td class='col-narrow'>"+o.active+"</td><td class='col-narrow'>"+o.errors+"</td><td>"+fmtBytes(o.bytes_up)+"</td><td>"+fmtBytes(o.bytes_down)+"</td></tr>";
+  }).join("")||'<tr><td colspan="9" class="empty">暂无出站链路</td></tr>';
+  document.getElementById("ls-body").innerHTML=d.listeners.map(function(l){return "<tr><td><code>"+esc(l.protocol)+"</code></td><td>"+esc(l.bind)+"</td></tr>";}).join("")||'<tr><td colspan="2" class="empty">暂无监听器</td></tr>';
+  document.getElementById("rt-body").innerHTML=d.routes.map(function(r){
+    var parts=[];
+    if(r.domain_suffix.length)parts.push(r.domain_suffix.map(function(x){return '<span class="chip">'+esc(x)+"</span>";}).join(""));
+    if(r.ip_cidr.length)parts.push(r.ip_cidr.map(function(x){return '<span class="chip">'+esc(x)+"</span>";}).join(""));
+    if(r.port.length)parts.push('<span class="chip">端口 '+esc(r.port.join(","))+"</span>");
+    return "<tr><td><b>"+esc(r.name)+"</b></td><td>"+(parts.join(" ")||'<span class="empty">全量</span>')+"</td><td><code>"+esc(r.match_mode)+"</code></td><td>"+esc(r.outbound)+"</td></tr>";
+  }).join("")||'<tr><td colspan="4" class="empty">暂无路由规则</td></tr>';
+}
+function renderNodes(nodes){
+  document.getElementById("node-body").innerHTML=nodes.map(function(n){return "<tr><td><b>"+esc(n.tag)+"</b></td><td><code>"+esc(n.type)+"</code></td><td>"+esc(n.server)+"</td><td>"+n.port+"</td></tr>";}).join("");
+}
+
+/* ===== 页面切换 ===== */
+document.querySelectorAll(".nav .item").forEach(function(item){
+  item.addEventListener("click",function(){
+    document.querySelectorAll(".nav .item").forEach(function(i){i.classList.remove("active");});
+    document.querySelectorAll(".panel").forEach(function(p){p.classList.remove("on");});
+    item.classList.add("active");
+    document.getElementById("panel-"+item.dataset.tab).classList.add("on");
+  });
+});
+
+renderOmni(DEMO_STATUS);
+renderNodes(DEMO_NODES);
+</script>
+</body>
+</html>
