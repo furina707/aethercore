@@ -36,3 +36,7 @@ sub
 # ===== WorkBuddy internal / analysis artifacts =====
 .workbuddy/
 dev-progress-report.html
+
+# ===== PyInstaller build outputs =====
+build/
+dist/
