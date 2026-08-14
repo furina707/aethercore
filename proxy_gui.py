@@ -22,11 +22,12 @@ import threading
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl, QSettings
+from PySide6.QtCore import Qt, QTimer, QUrl, QSettings, QObject, Signal
 from PySide6.QtGui import (
     QAction, QColor, QDesktopServices, QFont, QFontDatabase, QGuiApplication,
     QIcon, QKeySequence, QLinearGradient, QPainter, QPixmap, QShortcut,
 )
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFrame, QGraphicsDropShadowEffect, QGridLayout,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMenu,
@@ -963,6 +964,12 @@ class MainWindow(QMainWindow):
             self.raise_()
             self.activateWindow()
 
+    def bring_to_front(self):
+        """单实例唤醒：把窗口显示并置顶（含从托盘恢复）。"""
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     # ---------- 主题 ----------
 
     def toggle_theme(self):
@@ -1031,6 +1038,54 @@ class MainWindow(QMainWindow):
         QApplication.instance().quit()
 
 
+# ---------- 单实例锁 ----------
+
+class SingleInstance(QObject):
+    """单实例锁：命名管道握手，保证同一时间只有一个实例。
+
+    第二个实例启动时：
+      1. 尝试连接主实例监听的 QLocalServer（固定名称）
+      2. 连接成功 → 发送 "show" 消息，主实例收到后把窗口带到前台，本实例退出
+      3. 连接失败 → 本实例成为主实例，开始监听
+    """
+    activated = Signal()
+
+    def __init__(self, key: str, parent: QObject | None = None):
+        super().__init__(parent)
+        self.is_primary = False
+        self._server: QLocalServer | None = None
+
+        sock = QLocalSocket()
+        sock.connectToServer(key)
+        if sock.waitForConnected(400):
+            # 已有主实例 → 请求其显示窗口，然后本实例退出
+            sock.write(b"show")
+            sock.flush()
+            sock.waitForBytesWritten(400)
+            sock.disconnectFromServer()
+            return
+
+        # 无主实例 → 成为主实例（先清理可能的崩溃残留管道）
+        QLocalServer.removeServer(key)
+        self._server = QLocalServer()
+        if self._server.listen(key):
+            self.is_primary = True
+            self._server.newConnection.connect(self._on_new_connection)
+
+    def _on_new_connection(self):
+        conn = self._server.nextPendingConnection()
+        if conn is None:
+            return
+        conn.readyRead.connect(lambda: self._dispatch(conn))
+
+    def _dispatch(self, conn):
+        data = bytes(conn.readAll())
+        if b"show" in data:
+            self.activated.emit()
+        conn.disconnectFromServer()
+        conn.deleteLater()
+
+
 # ---------- 入口 ----------
 
 def main() -> int:
@@ -1080,6 +1135,19 @@ def main() -> int:
                         break
 
     win = MainWindow(demo=bool(shot), settings=settings, light=light)
+
+    # 单实例锁：截图模式跳过（无窗口需守护）；正常模式第二个实例自动退出
+    if not shot:
+        try:
+            import getpass
+            instance = SingleInstance(f"omni-proxy-gui-{getpass.getuser()}")
+            if not instance.is_primary:
+                print("已有一个实例在运行，本实例退出（已请求唤醒原窗口）")
+                return 0
+            instance.activated.connect(win.bring_to_front)
+        except Exception as e:
+            print(f"单实例锁初始化失败（降级为允许多实例）：{e}")
+
     win.show()
     app.processEvents()
 

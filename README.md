@@ -36,7 +36,7 @@
 | `update_singbox.py` | 自动从 GitHub 下载适配当前平台的最新 sing-box 并更新 `core/singbox-core/`（自动备份旧版本；API 限流时回退直链） | `python update_singbox.py --check` 仅查询 / `python update_singbox.py` 更新 |
 | `update_subscription.py` | **订阅更新器**：从 `sub` 中的订阅 URL 拉取节点（自动识别 base64/明文分享链接：vmess/vless/trojan/ss/hy2 或 sing-box JSON），去重后生成 `singbox-config.json`（保留旧配置的 log/dns/路由/入站，重建出站：DIRECT/REJECT + 节点 + `♻️自动选择` + `🚀节点选择`），写前自动备份 | `python update_subscription.py` 更新 / `--check` 仅统计 / `--dry-run` 预览节点 / `--url URL` 临时指定订阅 |
 | `singbox_docs.py` | 抓取 sing-box 官方配置要求，生成独立界面 `singbox-docs.html`（支持明暗主题；离线降级为内置快照） | `python singbox_docs.py` / `--offline` 强制离线 |
-| `proxy_gui.py` | **代理工具桌面 GUI**（PySide6/Qt）：一个窗口管理 omni-proxy（启停/实时统计/出站/路由）、sing-box（**订阅更新**/节点清单/启停/版本更新）与工具链（日志尾随/文档入口）。**系统托盘（最小化/气泡/菜单）+ 明暗主题切换（偏好记忆）+ Ctrl+1/2/3 切换页面 + 退出确认清理子进程 + 高 DPI 适配** | `pip install PySide6` 后 `python proxy_gui.py`；`--shot` 无头渲染截图，`--light` 强制浅色，`--dpi 1.5` 强制缩放调试；**打包独立 exe**：`python -m PyInstaller --onefile --windowed --name omni-proxy-gui proxy_gui.py`（产物 `dist/omni-proxy-gui.exe`，双击即用，无需 Python 环境） |
+| `proxy_gui.py` | **代理工具桌面 GUI**（PySide6/Qt）：一个窗口管理 omni-proxy（启停/实时统计/出站/路由）、sing-box（**订阅更新**/节点清单/启停/版本更新）与工具链（日志尾随/文档入口）。**单实例锁（重复启动自动唤醒原窗口）+ 系统托盘（最小化/气泡/菜单）+ 明暗主题切换（偏好记忆）+ Ctrl+1/2/3 切换页面 + 退出确认清理子进程 + 高 DPI 适配** | `pip install PySide6` 后 `python proxy_gui.py`；`--shot` 无头渲染截图，`--light` 强制浅色，`--dpi 1.5` 强制缩放调试；**打包独立 exe**：`python -m PyInstaller --onefile --windowed --name omni-proxy-gui proxy_gui.py`（产物 `dist/omni-proxy-gui.exe`，双击即用，无需 Python 环境） |
 
 ---
 
