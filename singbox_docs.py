@@ -182,47 +182,106 @@ def fetch_page(path: str) -> str:
 
 _CSS = """
 :root{
-  --bg:#f7f8fa; --card:#ffffff; --ink:#1f2430; --sub:#5b6472;
-  --line:#e6e9ef; --green:#1a9e6f; --amber:#d98a00; --red:#d2433a;
-  --blue:#2f6fed; --codebg:#eef1f6; --bar:#eef1f6;
+  --bg0:#0a0e16; --bg1:#10182a; --ink:#e9edf7; --sub:#94a1bb;
+  --line:rgba(255,255,255,.09); --card:rgba(255,255,255,.045);
+  --card-strong:rgba(255,255,255,.08); --codebg:#0c1220;
+  --indigo:#818cf8; --violet:#a78bfa; --cyan:#22d3ee;
+  --green:#34d399; --amber:#fbbf24; --red:#f87171;
+  --glow-a:rgba(99,102,241,.20); --glow-b:rgba(34,211,238,.12);
+  --shadow:0 10px 34px rgba(2,6,18,.45);
 }
-@media (prefers-color-scheme: dark){
+@media (prefers-color-scheme: light){
   :root{
-    --bg:#14161c; --card:#1e222b; --ink:#e6e9f0; --sub:#9aa3b2;
-    --line:#2d333f; --green:#3ecf8e; --amber:#e8a33d; --red:#ef6b60;
-    --blue:#6f9dff; --codebg:#262c37; --bar:#262c37;
+    --bg0:#f3f5fb; --bg1:#e9edf8; --ink:#151a28; --sub:#5a6784;
+    --line:rgba(20,30,60,.10); --card:rgba(255,255,255,.72);
+    --card-strong:rgba(255,255,255,.95); --codebg:#10162a;
+    --indigo:#4f5de0; --violet:#7c5cf0; --cyan:#0891b2;
+    --green:#059669; --amber:#b45309; --red:#dc2626;
+    --glow-a:rgba(99,102,241,.14); --glow-b:rgba(8,145,178,.10);
+    --shadow:0 10px 30px rgba(30,45,90,.12);
   }
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);
-  font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-  line-height:1.65;padding:28px 16px}
-.wrap{max-width:960px;margin:0 auto}
-h1{font-size:24px;margin:0 0 4px}
-.sub{color:var(--sub);font-size:13.5px;margin-bottom:22px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;
-  padding:18px 20px;margin-bottom:16px;box-shadow:0 1px 2px rgba(20,30,50,.05)}
-h2{font-size:17px;margin:0 0 12px;padding-left:10px;border-left:4px solid var(--blue)}
-h3{font-size:15px;margin:16px 0 8px}
-h4{font-size:14px;margin:12px 0 6px}
-.toc{display:flex;flex-wrap:wrap;gap:8px}
-.toc a{display:inline-block;padding:4px 12px;border:1px solid var(--line);
-  border-radius:20px;font-size:13px;color:var(--ink);text-decoration:none;background:var(--bg)}
-.toc a:hover{border-color:var(--blue);color:var(--blue)}
-.body{font-size:14px}
-.body pre{background:var(--codebg);border:1px solid var(--line);border-radius:8px;
-  padding:12px 14px;overflow-x:auto;font-size:12.5px}
-.body code{background:var(--codebg);padding:1px 6px;border-radius:5px;font-size:12.5px}
-.body pre code{background:none;padding:0}
-.body table{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}
-.body th,.body td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
-.body th{color:var(--sub);font-size:12px;background:var(--bg)}
-.body a{color:var(--blue)}
-.warn{background:rgba(217,138,0,.12);border-left:4px solid var(--amber);
-  padding:10px 14px;border-radius:8px;margin:8px 0;font-size:13.5px}
-.ok{background:rgba(26,158,111,.12);border-left:4px solid var(--green);
-  padding:10px 14px;border-radius:8px;margin:8px 0;font-size:13.5px}
+html{scroll-behavior:smooth}
+body{margin:0;color:var(--ink);
+  font-family:Inter,"Segoe UI",-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+  line-height:1.7;min-height:100vh;
+  background:
+    radial-gradient(900px 480px at 12% -8%, var(--glow-a), transparent 60%),
+    radial-gradient(820px 460px at 95% 0%, var(--glow-b), transparent 55%),
+    linear-gradient(168deg, var(--bg0), var(--bg1));
+  background-attachment:fixed;padding:28px 18px}
+.layout{display:grid;grid-template-columns:248px minmax(0,1fr);gap:24px;
+  max-width:1180px;margin:0 auto;align-items:start}
+@media (max-width:920px){.layout{grid-template-columns:1fr}}
+.sidebar{position:sticky;top:20px;align-self:start;min-width:0}
+@media (max-width:920px){.sidebar{position:static}}
+.brand{display:flex;align-items:center;gap:10px;margin:2px 0 14px 2px}
+.brand .logo{width:34px;height:34px;border-radius:10px;flex:none;
+  background:linear-gradient(135deg,var(--indigo),var(--violet));
+  display:flex;align-items:center;justify-content:center;
+  font-weight:800;font-size:15px;color:#fff;box-shadow:0 6px 18px var(--glow-a)}
+.brand b{font-size:15px;letter-spacing:.2px}
+.brand span{display:block;font-size:11.5px;color:var(--sub);font-weight:400}
+.toc{display:flex;flex-direction:column;gap:4px}
+.toc a{position:relative;display:block;padding:7px 12px;border-radius:10px;
+  color:var(--sub);text-decoration:none;font-size:13.5px;border:1px solid transparent;
+  transition:all .18s ease}
+.toc a::before{content:"";position:absolute;left:-2px;top:50%;transform:translateY(-50%);
+  width:3px;height:0;border-radius:3px;background:linear-gradient(180deg,var(--indigo),var(--cyan));
+  transition:height .18s ease}
+.toc a:hover{color:var(--ink);background:var(--card-strong);border-color:var(--line)}
+.toc a:hover::before{height:60%}
+.hero{padding:26px 26px 20px;margin-bottom:22px}
+h1{font-size:23px;margin:0 0 6px;letter-spacing:.2px;
+  background:linear-gradient(92deg,var(--ink),var(--sub));
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+.sub{color:var(--sub);font-size:13px;margin-bottom:16px}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:3px 11px;border-radius:999px;
+  font-size:12px;font-weight:600;border:1px solid var(--line);background:var(--card)}
+.badge.g{color:var(--green)} .badge.a{color:var(--amber)}
+.main{min-width:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;
+  padding:20px 22px;margin-bottom:18px;box-shadow:var(--shadow);
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  animation:rise .5s ease both;transition:transform .2s ease,border-color .2s ease}
+.card:hover{transform:translateY(-2px);border-color:var(--card-strong)}
+@keyframes rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+h2{font-size:17px;margin:0 0 14px;padding:0 0 10px 12px;position:relative;letter-spacing:.2px}
+h2::before{content:"";position:absolute;left:0;top:2px;bottom:12px;width:4px;border-radius:4px;
+  background:linear-gradient(180deg,var(--indigo),var(--cyan))}
+h3{font-size:15px;margin:18px 0 8px}
+h4{font-size:13.5px;margin:12px 0 6px}
+.body{font-size:14px;color:var(--ink)}
+.body pre{background:var(--codebg);border:1px solid var(--line);border-radius:12px;
+  padding:14px 16px;overflow-x:auto;font-size:12.5px;line-height:1.6;
+  color:#dbe4f5;box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}
+.body code{background:var(--card-strong);padding:2px 7px;border-radius:6px;font-size:12.5px;
+  border:1px solid var(--line)}
+.body pre code{background:none;padding:0;border:none;color:inherit}
+.body table{width:100%;border-collapse:separate;border-spacing:0;font-size:13px;margin:12px 0;
+  border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.body th,.body td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+.body tr:last-child td{border-bottom:none}
+.body th{color:var(--sub);font-size:12px;font-weight:600;
+  background:linear-gradient(180deg,var(--card-strong),transparent)}
+.body tbody tr{transition:background .15s ease}
+.body tbody tr:hover{background:var(--card-strong)}
+.body a{color:var(--indigo);text-decoration:none;border-bottom:1px dashed transparent;
+  transition:border-color .15s ease}
+.body a:hover{border-bottom-color:var(--indigo)}
+.body ul,.body ol{padding-left:20px}
+.body li{margin:4px 0}
+.warn{background:linear-gradient(135deg,rgba(251,191,36,.12),rgba(251,191,36,.05));
+  border-left:4px solid var(--amber);padding:11px 15px;border-radius:10px;margin:10px 0;font-size:13.5px}
+.ok{background:linear-gradient(135deg,rgba(52,211,153,.12),rgba(52,211,153,.05));
+  border-left:4px solid var(--green);padding:11px 15px;border-radius:10px;margin:10px 0;font-size:13.5px}
 .muted{color:var(--sub);font-size:12.5px}
+.src{color:var(--sub);font-size:12px;margin-top:12px}
+.src a{color:var(--indigo);text-decoration:none}
+::selection{background:rgba(129,140,248,.35)}
+code::-webkit-scrollbar,pre::-webkit-scrollbar{height:8px;width:8px}
+code::-webkit-scrollbar-thumb,pre::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px}
 """
 
 
@@ -231,7 +290,7 @@ def build_html(sections: list[dict], fetched: bool, offline: bool, generated: st
         f'<a href="#sec-{s["id"]}">{escape(s["title"])}</a>' for s in sections
     )
     body = []
-    for s in sections:
+    for i, s in enumerate(sections):
         inner = s["content"]
         if s.get("failed"):
             inner = (
@@ -239,20 +298,20 @@ def build_html(sections: list[dict], fetched: bool, offline: bool, generated: st
                 f'请访问官方文档：<a href="{s["url"]}">{s["url"]}</a></div>'
             )
         body.append(
-            f'<section class="card" id="sec-{s["id"]}">\n'
+            f'<section class="card" id="sec-{s["id"]}" style="animation-delay:{i * 60}ms">\n'
             f'  <h2>{escape(s["title"])}</h2>\n'
             f'  <div class="body">{inner}</div>\n'
-            f'  <div class="muted" style="margin-top:10px">来源：<a href="{s["url"]}">{s["url"]}</a></div>\n'
+            f'  <div class="src">来源：<a href="{s["url"]}">{s["url"]}</a></div>\n'
             f"</section>"
         )
 
     status = []
     if offline:
-        status.append('<span class="tag" style="color:var(--amber)">离线快照</span>')
+        status.append('<span class="badge a">离线快照</span>')
     elif fetched:
-        status.append('<span style="color:var(--green)">已在线抓取官方文档</span>')
+        status.append('<span class="badge g">已在线抓取官方文档</span>')
     else:
-        status.append('<span style="color:var(--amber)">在线抓取失败，展示内置结构快照</span>')
+        status.append('<span class="badge a">在线抓取失败 · 内置结构快照</span>')
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -263,20 +322,28 @@ def build_html(sections: list[dict], fetched: bool, offline: bool, generated: st
 <style>{_CSS}</style>
 </head>
 <body>
-<div class="wrap">
-  <div class="card">
-    <h1>sing-box 官方配置要求</h1>
-    <div class="sub">
-      抓取自 <a href="{SITE}/configuration/">{SITE}/configuration/</a> · 生成时间 {generated} ·
-      {" ".join(status)}
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">sb</div>
+      <b>sing-box<span>官方配置要求</span></b>
     </div>
-    <div class="toc">{toc}</div>
-  </div>
-  {"\n".join(body)}
-  <div class="muted" style="text-align:center;margin-top:8px">
-    本界面由 singbox_docs.py 抓取官方文档生成；以官方站点为准，必要时运行
-    <code>python singbox_docs.py</code> 重新抓取。
-  </div>
+    <nav class="toc">{toc}</nav>
+  </aside>
+  <main class="main">
+    <header class="card hero">
+      <h1>sing-box 官方配置要求</h1>
+      <div class="sub">
+        抓取自 <a href="{SITE}/configuration/" style="color:var(--indigo)">{SITE}/configuration/</a>
+        · 生成时间 {generated} · {" ".join(status)}
+      </div>
+    </header>
+    {"\n".join(body)}
+    <div class="muted" style="text-align:center;margin:10px 0 20px">
+      本界面由 singbox_docs.py 抓取官方文档生成；以官方站点为准，必要时运行
+      <code>python singbox_docs.py</code> 重新抓取。
+    </div>
+  </main>
 </div>
 </body>
 </html>
