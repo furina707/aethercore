@@ -24,7 +24,7 @@ __pycache__/
 *.pyc
 
 # ===== Temporary GUI preview screenshots =====
-gui-shot.png
+gui-shot*.png
 
 # ===== Third-party prebuilt binaries =====
 core/singbox-core/

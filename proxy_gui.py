@@ -22,13 +22,16 @@ import threading
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QGuiApplication
+from PySide6.QtCore import Qt, QTimer, QUrl, QSettings
+from PySide6.QtGui import (
+    QAction, QColor, QDesktopServices, QFont, QFontDatabase, QGuiApplication,
+    QIcon, QKeySequence, QLinearGradient, QPainter, QPixmap, QShortcut,
+)
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
-    QSplitter, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget,
+    QApplication, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
+    QPushButton, QSplitter, QStackedWidget, QSystemTrayIcon, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -122,7 +125,7 @@ def latest_log_file() -> Path | None:
 
 # ---------- 主题 ----------
 
-QSS = """
+DARK_QSS = """
 QMainWindow, QWidget#root {
   background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #0c1019, stop:1 #131b2e);
   color: #e9edf7;
@@ -194,7 +197,103 @@ QStatusBar { color: #8b96ad; background: transparent; }
 QScrollBar:vertical { background: transparent; width: 10px; }
 QScrollBar::handle:vertical { background: rgba(255,255,255,0.14); border-radius: 5px; }
 QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
+QCheckBox { color: #c3cadb; spacing: 6px; }
+QMenu { background: #141b2e; color: #dde3f0; border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 8px; padding: 4px; }
+QMenu::item { padding: 6px 22px; border-radius: 6px; }
+QMenu::item:selected { background: rgba(129,140,248,0.28); }
 """
+
+# 亮色主题（QSS 语法，切换时整表替换）
+LIGHT_QSS = """
+QMainWindow, QWidget#root {
+  background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #f3f5fb, stop:1 #e6ebf6);
+  color: #1a2030;
+  font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+  font-size: 13px;
+}
+QFrame#card {
+  background: rgba(255,255,255,0.82);
+  border: 1px solid rgba(20,30,60,0.12);
+  border-radius: 12px;
+}
+QFrame#card:hover { border-color: rgba(79,93,224,0.45); }
+QLabel#kpiV { font-size: 22px; font-weight: 800; color: #4f5de0; }
+QLabel#kpiL { font-size: 11px; color: #5f6c88; }
+QLabel#secTitle {
+  font-size: 15px; font-weight: 700; color: #1a2030;
+  padding-left: 10px;
+  border-left: 3px solid qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #6366f1, stop:1 #0891b2);
+}
+QPushButton {
+  background: rgba(99,102,241,0.12);
+  border: 1px solid rgba(99,102,241,0.4);
+  color: #4f5de0; border-radius: 9px; padding: 7px 16px; font-weight: 600;
+}
+QPushButton:hover { background: rgba(99,102,241,0.2); }
+QPushButton:pressed { background: rgba(99,102,241,0.3); }
+QPushButton#danger {
+  background: rgba(220,38,38,0.08);
+  border-color: rgba(220,38,38,0.4); color: #c62828;
+}
+QPushButton#danger:hover { background: rgba(220,38,38,0.15); }
+QPushButton#ghost {
+  background: transparent; border-color: rgba(20,30,60,0.18); color: #3d4a66;
+}
+QPushButton#ghost:hover { background: rgba(20,30,60,0.06); }
+QPushButton:disabled { color: #a3adc2; border-color: rgba(20,30,60,0.08); background: transparent; }
+QTableWidget {
+  background: rgba(255,255,255,0.6); alternate-background-color: rgba(20,30,60,0.025);
+  border: 1px solid rgba(20,30,60,0.12); border-radius: 10px;
+  gridline-color: rgba(20,30,60,0.07); color: #1a2030;
+  selection-background-color: rgba(99,102,241,0.22);
+}
+QHeaderView::section {
+  background: rgba(20,30,60,0.05); color: #5f6c88;
+  border: none; border-bottom: 1px solid rgba(20,30,60,0.12);
+  padding: 6px 8px; font-weight: 600;
+}
+QListWidget#nav {
+  background: rgba(255,255,255,0.55);
+  border: 1px solid rgba(20,30,60,0.12); border-radius: 12px;
+  padding: 6px;
+}
+QListWidget#nav::item {
+  border-radius: 9px; padding: 9px 12px; margin: 2px 0; color: #3d4a66;
+}
+QListWidget#nav::item:selected {
+  background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #6366f1, stop:1 #8b5cf6);
+  color: #ffffff; font-weight: 600;
+}
+QListWidget#nav::item:hover:!selected { background: rgba(20,30,60,0.06); }
+QPlainTextEdit, QTextEdit {
+  background: rgba(255,255,255,0.85); border: 1px solid rgba(20,30,60,0.12);
+  border-radius: 10px; color: #26304a; font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px; selection-background-color: rgba(99,102,241,0.22);
+}
+QStatusBar { color: #5f6c88; background: transparent; }
+QScrollBar:vertical { background: transparent; width: 10px; }
+QScrollBar::handle:vertical { background: rgba(20,30,60,0.2); border-radius: 5px; }
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
+QCheckBox { color: #3d4a66; spacing: 6px; }
+QMenu { background: #ffffff; color: #1a2030; border: 1px solid rgba(20,30,60,0.15);
+  border-radius: 8px; padding: 4px; }
+QMenu::item { padding: 6px 22px; border-radius: 6px; }
+QMenu::item:selected { background: rgba(99,102,241,0.16); }
+"""
+
+
+def apply_theme(app: QApplication, light: bool) -> None:
+    """切换全局主题并返回当前是否浅色。"""
+    app.setStyleSheet(LIGHT_QSS if light else DARK_QSS)
+
+
+def tray_notify(title: str, msg: str, timeout: int = 3000) -> None:
+    """托盘气泡通知（托盘不可用时静默忽略）。"""
+    app = QApplication.instance()
+    tray = getattr(app, "_tray", None)
+    if tray is not None and QSystemTrayIcon.isSystemTrayAvailable():
+        tray.showMessage(title, msg, QSystemTrayIcon.Information, timeout)
 
 # ---------- 演示数据（截图模式） ----------
 
@@ -377,8 +476,10 @@ class OmniPage(QWidget):
             QMessageBox.critical(self, "omni-proxy", f"启动失败：{e}")
             return
         self.btn_start.setEnabled(False)
+        self.btn_start.setText("启动中…")
         self.btn_stop.setEnabled(True)
         self.status_lb.setText("启动中…（等待 Web 控制台就绪）")
+        tray_notify("omni-proxy", "正在启动…")
 
     def stop_omni(self):
         if self.proc and self.proc.poll() is None:
@@ -389,8 +490,10 @@ class OmniPage(QWidget):
                 self.proc.kill()
         self.proc = None
         self.btn_start.setEnabled(True)
+        self.btn_start.setText("启动 omni-proxy")
         self.btn_stop.setEnabled(False)
         self.set_offline()
+        tray_notify("omni-proxy", "已停止")
 
     def set_offline(self):
         self.status_dot.setStyleSheet("color:#f87171;font-size:16px;")
@@ -403,6 +506,10 @@ class OmniPage(QWidget):
         if data is None:
             self.set_offline()
             return
+        # 启动中 → 就绪 状态迁移
+        if self.btn_start.text() == "启动中…":
+            self.btn_start.setText("启动 omni-proxy")
+            tray_notify("omni-proxy", "Web 控制台已就绪")
         self.render(data, False)
 
     def render(self, d: dict, demo: bool):
@@ -525,6 +632,7 @@ class SingboxPage(QWidget):
         self.btn_stop.setEnabled(True)
         self.status_dot.setStyleSheet("color:#34d399;font-size:16px;")
         self.status_lb.setText(f"运行中（PID {self.proc.pid}）")
+        tray_notify("sing-box", f"已启动（PID {self.proc.pid}）")
 
     def stop_singbox(self):
         if self.proc and self.proc.poll() is None:
@@ -538,6 +646,7 @@ class SingboxPage(QWidget):
         self.btn_stop.setEnabled(False)
         self.status_dot.setStyleSheet("color:#64748b;font-size:16px;")
         self.status_lb.setText("未运行")
+        tray_notify("sing-box", "已停止")
 
     def _run_script(self, args: list[str]):
         self.out.clear()
@@ -584,6 +693,12 @@ class ToolsPage(QWidget):
         lay.addLayout(row)
 
         lay.addWidget(section_title("omni-proxy 日志（自动尾随）"))
+        head = QHBoxLayout()
+        self.chk_follow = QCheckBox("自动滚动到底部")
+        self.chk_follow.setChecked(True)
+        head.addWidget(self.chk_follow)
+        head.addStretch(1)
+        lay.addLayout(head)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         lay.addWidget(self.log, 1)
@@ -612,6 +727,9 @@ class ToolsPage(QWidget):
         f = latest_log_file()
         if f:
             self.log.setPlainText(tail_lines(f))
+            if self.chk_follow.isChecked():
+                sb = self.log.verticalScrollBar()
+                sb.setValue(sb.maximum())
         elif not self.log.toPlainText():
             self.log.setPlainText("（暂无日志）")
 
@@ -623,12 +741,21 @@ class ToolsPage(QWidget):
 # ---------- 主窗口 ----------
 
 class MainWindow(QMainWindow):
-    def __init__(self, demo: bool = False):
+    def __init__(self, demo: bool = False, settings: QSettings | None = None, light: bool = False):
         super().__init__()
         self._demo = demo
+        self._settings = settings or QSettings("omni-proxy", "proxy-gui")
+        self._light = light
+        self._tray = None
+        self._quit_requested = False
         self.setWindowTitle("代理工具控制台 · omni-proxy / sing-box")
         self.resize(1180, 760)
         self.setObjectName("root")
+
+        # 恢复上次窗口几何
+        geo = self._settings.value("geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -653,9 +780,94 @@ class MainWindow(QMainWindow):
         root_lay.addWidget(self.stack, 1)
 
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
-        self.nav.setCurrentRow(0)
+        # 恢复上次浏览的页面
+        self.nav.setCurrentRow(int(self._settings.value("page", 0)))
 
+        # 状态栏：主题切换按钮（常驻）
+        self.btn_theme = QPushButton("浅色" if self._light else "深色")
+        self.btn_theme.setObjectName("ghost")
+        self.btn_theme.setFixedWidth(64)
+        self.btn_theme.setToolTip("切换明暗主题")
+        self.btn_theme.clicked.connect(self.toggle_theme)
+        self.statusBar().addPermanentWidget(self.btn_theme)
         self.statusBar().showMessage(f"工作目录：{ROOT} · 初始化…")
+
+        # 快捷键：Ctrl+1/2/3 切换页面
+        for i, key in enumerate(("1", "2", "3")):
+            QShortcut(QKeySequence(f"Ctrl+{key}"), self,
+                      lambda i=i: self.nav.setCurrentRow(i))
+
+        self._init_tray()
+
+    # ---------- 托盘 ----------
+
+    def _init_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self._tray = QSystemTrayIcon(self._make_icon(), self)
+        menu = QMenu(self)
+        act_toggle = QAction("显示 / 隐藏", menu)
+        act_toggle.triggered.connect(self._toggle_visible)
+        act_theme = QAction("切换主题", menu)
+        act_theme.triggered.connect(self.toggle_theme)
+        act_quit = QAction("退出", menu)
+        act_quit.triggered.connect(self.quit_app)
+        menu.addAction(act_toggle)
+        menu.addAction(act_theme)
+        menu.addSeparator()
+        menu.addAction(act_quit)
+        self._tray.setContextMenu(menu)
+        self._tray.setToolTip("代理工具控制台 · omni-proxy / sing-box")
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+        QApplication.instance()._tray = self._tray
+        if not self._demo:
+            self._tray.showMessage(
+                "代理工具控制台", "已最小化到系统托盘，双击图标可恢复窗口",
+                QSystemTrayIcon.Information, 2500)
+
+    @staticmethod
+    def _make_icon() -> QIcon:
+        pm = QPixmap(64, 64)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        grad = QLinearGradient(0, 0, 64, 64)
+        grad.setColorAt(0, QColor("#6366f1"))
+        grad.setColorAt(1, QColor("#8b5cf6"))
+        p.setBrush(grad)
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(2, 2, 60, 60, 14, 14)
+        p.setPen(QColor("#ffffff"))
+        f = p.font()
+        f.setBold(True)
+        f.setPointSize(16)
+        p.setFont(f)
+        p.drawText(pm.rect(), Qt.AlignCenter, "om")
+        p.end()
+        return QIcon(pm)
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self._toggle_visible()
+
+    def _toggle_visible(self):
+        if self.isVisible():
+            self.hide()
+        else:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+
+    # ---------- 主题 ----------
+
+    def toggle_theme(self):
+        self._light = not self._light
+        apply_theme(QApplication.instance(), self._light)
+        self.btn_theme.setText("浅色" if self._light else "深色")
+        self._settings.setValue("theme", "light" if self._light else "dark")
+
+    # ---------- 生命周期 ----------
 
     def showEvent(self, ev):
         """显示时按屏幕可用区与 DPI 校正窗口尺寸，并展示缩放信息。"""
@@ -672,9 +884,47 @@ class MainWindow(QMainWindow):
             + (" · [演示数据模式]" if self._demo else ""))
 
     def closeEvent(self, ev):
+        # 有关闭按钮 = 最小化到托盘（托盘可用且非主动退出时）
+        if self._tray is not None and not self._quit_requested:
+            ev.ignore()
+            self.hide()
+            return
         for p in self.pages:
             p.closeEvent(ev)
+        self._save_state()
         super().closeEvent(ev)
+
+    def _save_state(self):
+        s = self._settings
+        s.setValue("geometry", self.saveGeometry())
+        s.setValue("page", self.nav.currentRow())
+        s.setValue("theme", "light" if self._light else "dark")
+        s.sync()
+
+    def quit_app(self):
+        """退出前确认子进程处理并保存偏好。"""
+        running = [(n, p) for n, p in
+                   (("omni-proxy", self.pages[0].proc), ("sing-box", self.pages[1].proc))
+                   if p is not None and p.poll() is None]
+        if running and not self._demo:
+            box = QMessageBox(self)
+            box.setWindowTitle("退出代理工具控制台")
+            box.setText("以下进程仍在运行：\n\n" + "\n".join(
+                f"  · {n}（PID {p.pid}）" for n, p in running) + "\n\n是否先停止它们？")
+            btn_stop = box.addButton("停止并退出", QMessageBox.AcceptRole)
+            btn_keep = box.addButton("保留进程退出", QMessageBox.DestructiveRole)
+            btn_cancel = box.addButton("取消", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_stop)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is btn_cancel or clicked is None:
+                return
+            if clicked is btn_stop:
+                self.pages[0].stop_omni()
+                self.pages[1].stop_singbox()
+        self._quit_requested = True
+        self._save_state()
+        QApplication.instance().quit()
 
 
 # ---------- 入口 ----------
@@ -704,7 +954,13 @@ def main() -> int:
                 print(f"忽略无效 --dpi 值：{args[i + 1]}")
 
     app = QApplication(sys.argv[:1])
-    app.setStyleSheet(QSS)
+    settings = QSettings("omni-proxy", "proxy-gui")
+    # 截图模式由 --light 显式决定；正常模式记忆偏好
+    if shot:
+        light = "--light" in args
+    else:
+        light = ("--light" in args) or (settings.value("theme", "dark") == "light")
+    apply_theme(app, light)
 
     # offscreen 模式下注入系统中文字体（真实桌面运行无需此步）
     if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
@@ -719,7 +975,7 @@ def main() -> int:
                         app.setFont(QFont(fams[0], 10))
                         break
 
-    win = MainWindow(demo=bool(shot))
+    win = MainWindow(demo=bool(shot), settings=settings, light=light)
     win.show()
     app.processEvents()
 
