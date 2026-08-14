@@ -437,7 +437,8 @@ def kpi_card(label: str) -> tuple[QFrame, QLabel]:
     lay.setSpacing(2)
     lay.addWidget(v)
     lay.addWidget(l)
-    soften(frame, blur=26, dy=6, alpha=45)
+    # 不加 soften()：QGraphicsDropShadowEffect 在真实桌面会强制离屏渲染，
+    # 破坏 QSS，导致内容变白/不显示。卡片层次靠 QSS qlineargradient+border 实现。
     return frame, v
 
 
@@ -449,7 +450,8 @@ def make_table(headers: list[str], rows: int = 0) -> QTableWidget:
     t.setEditTriggers(QTableWidget.NoEditTriggers)
     t.setSelectionBehavior(QTableWidget.SelectRows)
     t.horizontalHeader().setStretchLastSection(True)
-    soften(t, blur=30, dy=7, alpha=45)
+    # 注意：不调用 soften() 给 QTableWidget 加 QGraphicsDropShadowEffect
+    # —— 真实桌面下会让子控件离屏渲染，破坏 QSS，导致表格内容/滚动条变白。
     return t
 
 
@@ -677,7 +679,7 @@ class SingboxPage(QWidget):
         self.out = QPlainTextEdit()
         self.out.setReadOnly(True)
         self.out.setMaximumHeight(150)
-        soften(self.out, blur=26, dy=6, alpha=40)
+        # 不加 soften()：QPlainTextEdit 在真实桌面加 graphics effect 会破坏 QSS 渲染
         lay.addWidget(self.out)
 
         self.btn_start.clicked.connect(self.start_singbox)
@@ -804,7 +806,7 @@ class ToolsPage(QWidget):
         lay.addLayout(head)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        soften(self.log, blur=30, dy=7, alpha=45)
+        # 不加 soften()：QPlainTextEdit 在真实桌面加 graphics effect 会破坏 QSS 渲染
         lay.addWidget(self.log, 1)
 
         btn_docs.clicked.connect(lambda: self._open_file(ROOT / "singbox-docs.html"))
@@ -870,7 +872,7 @@ class MainWindow(QMainWindow):
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
         self.nav.setFixedWidth(180)
-        soften(self.nav, blur=34, dy=8, alpha=50)
+        # 不加 soften()：QListWidget 在真实桌面加 graphics effect 会破坏 QSS 渲染
         for name in ("omni-proxy 核心", "sing-box 节点", "工具链"):
             item = QListWidgetItem(name)
             item.setSizeHint(item.sizeHint())
