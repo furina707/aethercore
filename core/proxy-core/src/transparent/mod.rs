@@ -2,6 +2,7 @@
 //!   - pac.rs      方案1：系统代理 / PAC 自动配置（用户态，无需管理员）
 //!   - wfp.rs      方案3：WFP 重定向（内核级 TCP 透明重定向，需管理员 + callout 驱动）
 //!   - wintun_tun.rs 方案2：Wintun 虚拟网卡 TUN（用户态捕获流量，需 wintun.dll + 管理员）
+pub mod netpkt;
 pub mod pac;
 pub mod wfp;
 pub mod wintun_tun;

@@ -34,6 +34,9 @@ http = "1"
 httparse = "1"
 
 [target.'cfg(windows)'.dependencies]
+# Wintun 虚拟网卡（透明代理方案2）：安全的 Rust 绑定，封装 wintun.dll 的 C ABI。
+# 仅 Windows 编译，避免非 Windows 平台因 Windows-only 依赖而构建失败。
+wintun = "0.4"
 windows = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_Networking_WinInet",

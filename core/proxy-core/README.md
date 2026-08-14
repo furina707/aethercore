@@ -49,7 +49,7 @@
 ### 透明代理（Windows）
 三种方案可单独启用：
 - **方案 1 — PAC**：用户态 HTTP 服务返回 PAC 脚本，浏览器/系统按脚本分流，无需管理员
-- **方案 2 — Wintun TUN**：动态加载 `wintun.dll` 创建虚拟网卡捕获流量（需管理员 + DLL）
+- **方案 2 — Wintun TUN**：动态加载 `wintun.dll` 创建虚拟网卡捕获流量，用户态自研最小 TCP 状态机 + UDP NAT 做 L3/L4 终止，桥接出站链路（需管理员 + DLL）
 - **方案 3 — WFP**：内核级 TCP 透明重定向（需管理员 + callout 驱动，当前为脚手架）
 
 ## 快速开始
@@ -183,13 +183,16 @@ cargo test --bin omni-proxy
 覆盖：
 - 路由引擎：域名后缀（精确/子域/大小写/前缀混淆）、CIDR（v4/v6/32 位主机/0.0.0.0/0 全捕获/非法输入）、端口匹配、`any`/`all` 模式、规则顺序、空规则
 - CLI 参数解析：位置参数、`-c`/`--config`/`--config=`、`--check`、`-v`/`-q`、优先级
+- 配置加载/校验：合法与非法 schema、默认值、可选字段（config.rs）
+- 可观测性统计：计数/字节累计/每出站聚合（observe.rs）
+- 透明代理包逻辑：IPv4/TCP/UDP 解析、Internet 校验和、MSS 解析、回包构造与畸形包拒收（transparent/netpkt.rs）
 
 ## 已知限制 / TODO
 
 - **Shadowsocks / Vmess 出站**：协议栈未实现，当前回退直连并告警
 - **SOCKS5 UDP_ASSOCIATE**：服务端仅回送占位响应，未真正中转 UDP
-- **Wintun TUN**：仅给出 DLL 加载与会话骨架，未实现完整 L3/L4 重组
-- **WFP 重定向**：需配套内核驱动 `omni-proxy-wfp.sys`，当前为用户态脚手架
+- **Wintun TUN**：已实现用户态 L3/L4 终止（自研最小 TCP 状态机 + UDP NAT），桥接到 `relay::dial_outbound_state` 复用路由/健康探测/TLS；`cargo check --tests` 编译通过。**运行时**仍需 `wintun.dll`（x64）+ 管理员权限 + 路由引流（如 `route add`），尚未做端到端实测；RFC 完整性（SACK/窗口缩放/PMTU）为已知缺口，必要时可换 smoltcp 加固
+- **WFP 重定向**：两种落地方式——(1) WFP 内建 ALE_REDIRECT（纯用户态，无需自研驱动，推荐）；(2) 自定义 Callout 驱动 `omni-proxy-wfp.sys`（完全控制）。当前 `wfp.rs` 仅提供用户态管理引擎骨架，两种方式均未完整实现，需配套 WFP 管理 API 调用；生产可用请优先选方案1(PAC) 或方案2(Wintun)
 - **连接池**：`outbound.pool_size` 字段已定义但未启用（每次新建连接）
 - **HTTP 转发**：响应体仅处理 `Content-Length` 与 `Transfer-Encoding: chunked`，`Connection: close` 模式按读到 EOF 处理
 
