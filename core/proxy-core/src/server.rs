@@ -51,6 +51,9 @@ pub async fn run(config_path: &str, log_level_override: Option<&str>) -> Result<
         }
     }
 
+    // 内置 Web 控制台（程序 UI）：默认 http://127.0.0.1:9090，OMNI_WEBUI_PORT 可覆盖
+    crate::webui::spawn(state.clone(), stats.clone());
+
     // 预构建 TLS 服务端配置（基于当前配置）
     let tls_acceptor = {
         let cfg = state.config();

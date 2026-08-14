@@ -12,6 +12,7 @@ mod socks;
 mod state;
 mod tls;
 mod transparent;
+mod webui;
 
 use anyhow::Result;
 use std::path::Path;

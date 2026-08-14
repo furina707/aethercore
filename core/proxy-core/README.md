@@ -39,6 +39,8 @@
 - **按 outbound 累计**的连接数、活跃数、错误数、上传/下载字节
 - 周期性日志采样
 - 连接空闲超时（`observability.idle_timeout_secs`，默认 300s）
+- **内置 Web 控制台**：启动后自动监听 `http://127.0.0.1:9090`（可用环境变量 `OMNI_WEBUI_PORT` 覆盖），
+  提供实时统计 / 出站链路健康与流量 / 监听器 / 路由规则的可视化界面，每 2s 自动刷新
 
 ### 可靠性
 - **配置热重载**：`hot_reload_secs` 指定周期，进程内原子替换
@@ -173,6 +175,7 @@ src/
 ├── tls.rs               rustls 服务端/客户端配置，支持 mTLS
 ├── observe.rs           可观测性：日志、全局统计、per-outbound 统计
 ├── elevate.rs           Windows 内置提权：启动检测管理员，UAC 重启（配合 src/bin/elevater.rs）
+├── webui.rs             内置 Web 控制台：极简 HTTP 服务 + /api/status JSON + 内嵌现代 UI
 └── transparent/         Windows 透明代理
     ├── mod.rs           统一入口
     ├── pac.rs           方案 1：PAC 自动配置

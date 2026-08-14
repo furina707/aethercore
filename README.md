@@ -16,7 +16,7 @@
 - 启动方式：
   - 开发调试：`cd core/proxy-core && cargo run -- proxy-config.json`
   - 生产（零参数）：`python launcher.py`（自动定位编译产物并传入配置）
-- 当前能力：HTTP/HTTPS/SOCKS4-5/DNS + TLS + 规则路由 + 配置热重载 + 健康检查故障转移 + PAC/Wintun 透明代理 + 内置 UAC 提权。
+- 当前能力：HTTP/HTTPS/SOCKS4-5/DNS + TLS + 规则路由 + 配置热重载 + 健康检查故障转移 + PAC/Wintun 透明代理 + 内置 UAC 提权 + 内置 Web 控制台（`http://127.0.0.1:9090`）。
 - 状态：v0.1.0，MVP 完成度较高；WFP 透明代理、SOCKS5 UDP、Shadowsocks/Vmess 出站仍处部分/待实现。
 
 ## 2. sing-box（预编译二进制）
