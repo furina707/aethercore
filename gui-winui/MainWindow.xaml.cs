@@ -3,6 +3,7 @@ using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading.Tasks;
 using Microsoft.UI.Xaml;
@@ -228,6 +229,7 @@ public sealed partial class MainWindow : Window
             demo = true;
         }
         Render(d, demo);
+        RefreshProxyStates();
     }
 
     private void Render(JsonElement d, bool demo)
@@ -457,6 +459,126 @@ public sealed partial class MainWindow : Window
     private static async Task LaunchUri(string uri)
     {
         try { await Windows.System.Launcher.LaunchUriAsync(new Uri(uri)); } catch { }
+    }
+
+    // ===== 系统代理（Windows 注册表 + 通知系统刷新） =====
+    private const string ProxyKey = @"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    [DllImport("wininet.dll", SetLastError = true)]
+    private static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);
+    [DllImport("shell32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsUserAnAdmin();
+
+    private static string SysProxyGet()
+    {
+        try
+        {
+            using var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(ProxyKey);
+            var en = (int?)(k?.GetValue("ProxyEnable")) ?? 0;
+            var srv = (string?)(k?.GetValue("ProxyServer")) ?? "";
+            return en == 1 ? srv : "";
+        }
+        catch { return ""; }
+    }
+
+    private static void SysProxySet(bool enable, string server = "")
+    {
+        try
+        {
+            using var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(ProxyKey);
+            k.SetValue("ProxyEnable", enable ? 1 : 0, Microsoft.Win32.RegistryValueKind.DWord);
+            if (enable) k.SetValue("ProxyServer", server);
+            // 通知系统立即刷新代理设置
+            InternetSetOption(IntPtr.Zero, 39, IntPtr.Zero, 0); // SETTINGS_CHANGED
+            InternetSetOption(IntPtr.Zero, 37, IntPtr.Zero, 0); // REFRESH
+        }
+        catch { }
+    }
+
+    private void RefreshProxyStates()
+    {
+        var s = SysProxyGet();
+        var t = s == "" ? "未开启" : $"已开启 → {s}";
+        OmniSysProxyState.Text = t;
+        SbSysProxyState.Text = t;
+    }
+
+    /// <summary>omni-proxy 的 HTTP 监听端口（从 proxy-config.json 读取，默认 8080）。</summary>
+    private int OmniHttpPort()
+    {
+        var cfg = Path.Combine(_root, "proxy-config.json");
+        if (File.Exists(cfg))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(cfg));
+                foreach (var l in doc.RootElement.GetProperty("server").GetProperty("listeners").EnumerateArray())
+                {
+                    if (l.TryGetProperty("protocol", out var p) && p.GetString() == "http"
+                        && l.TryGetProperty("bind", out var b) && b.ValueKind == JsonValueKind.String)
+                    {
+                        var s = b.GetString()!;
+                        var idx = s.LastIndexOf(':');
+                        if (idx >= 0 && int.TryParse(s[(idx + 1)..], out var port)) return port;
+                    }
+                }
+            }
+            catch { }
+        }
+        return 8080;
+    }
+
+    private void OmniSysProxyOn_Click(object sender, RoutedEventArgs e)
+    {
+        SysProxySet(true, $"127.0.0.1:{OmniHttpPort()}");
+        RefreshProxyStates();
+    }
+
+    private void OmniSysProxyOff_Click(object sender, RoutedEventArgs e)
+    {
+        SysProxySet(false);
+        RefreshProxyStates();
+    }
+
+    private void SbSysProxyOn_Click(object sender, RoutedEventArgs e)
+    {
+        SysProxySet(true, "127.0.0.1:9090"); // sing-box mixed 监听
+        RefreshProxyStates();
+    }
+
+    private void SbSysProxyOff_Click(object sender, RoutedEventArgs e)
+    {
+        SysProxySet(false);
+        RefreshProxyStates();
+    }
+
+    private void OmniTun_Click(object sender, RoutedEventArgs e)
+    {
+        if (!IsUserAnAdmin())
+        {
+            // TUN 需要管理员：经 omni-elevater 提权启动 omni-proxy（配置启用 wintun 时自动生效）
+            var elev = FindBinary("proxy-core", "omni-elevater");
+            var omni = FindBinary("proxy-core", "omni-proxy");
+            if (elev == null || omni == null)
+            {
+                SbOutput.Text = "未找到 omni-elevater / omni-proxy。TUN 模式需要：管理员权限 + wintun.dll + 配置启用 transparent.wintun。";
+                return;
+            }
+            try
+            {
+                Process.Start(new ProcessStartInfo(elev)
+                {
+                    UseShellExecute = true,
+                    Arguments = $"\"{omni}\" \"{Path.Combine(_root, "proxy-config.json")}\"",
+                });
+                SbOutput.Text = "已请求 UAC 提权启动 omni-proxy（TUN 模式）。确认 wintun.dll 存在且配置启用 transparent.wintun。";
+            }
+            catch (Exception ex) { SbOutput.Text = $"TUN 提权失败：{ex.Message}"; }
+        }
+        else
+        {
+            SbOutput.Text = "当前已是管理员。TUN 模式需 wintun.dll（core/singbox-core/ 或系统目录）且配置启用 transparent.wintun；请确认后点击「启动核心」。";
+        }
     }
 
     private string? FindBinary(string subdir, string name)
