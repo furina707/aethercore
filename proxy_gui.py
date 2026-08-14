@@ -23,7 +23,7 @@ import urllib.request
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase
+from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
@@ -625,6 +625,7 @@ class ToolsPage(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self, demo: bool = False):
         super().__init__()
+        self._demo = demo
         self.setWindowTitle("代理工具控制台 · omni-proxy / sing-box")
         self.resize(1180, 760)
         self.setObjectName("root")
@@ -654,9 +655,21 @@ class MainWindow(QMainWindow):
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
         self.nav.setCurrentRow(0)
 
+        self.statusBar().showMessage(f"工作目录：{ROOT} · 初始化…")
+
+    def showEvent(self, ev):
+        """显示时按屏幕可用区与 DPI 校正窗口尺寸，并展示缩放信息。"""
+        super().showEvent(ev)
+        scr = self.screen()
+        if scr is not None:
+            # 逻辑像素窗口尺寸超出屏幕可用区时收缩到 92%（高 DPI 屏幕常见）
+            avail = scr.availableGeometry()
+            if self.width() > avail.width() or self.height() > avail.height():
+                self.resize(int(avail.width() * 0.92), int(avail.height() * 0.92))
+        dpr = self.devicePixelRatioF()
         self.statusBar().showMessage(
-            f"工作目录：{ROOT} · Web 控制台：http://127.0.0.1:9090"
-            + (" · [演示数据模式]" if demo else ""))
+            f"工作目录：{ROOT} · Web 控制台：http://127.0.0.1:9090 · 显示缩放 {dpr:.2f}×"
+            + (" · [演示数据模式]" if self._demo else ""))
 
     def closeEvent(self, ev):
         for p in self.pages:
@@ -673,6 +686,22 @@ def main() -> int:
         i = args.index("--shot")
         shot = args[i + 1] if i + 1 < len(args) else "gui-shot.png"
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    # ---- 高 DPI 适配（必须在 QApplication 创建前生效）----
+    # 精确缩放策略：允许 125%/150% 等任意比例，避免默认取整导致的模糊/错位
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
+    os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
+    # --dpi 调试参数：用 QT_SCALE_FACTOR 强制缩放因子（如 --dpi 1.5）
+    if "--dpi" in args:
+        i = args.index("--dpi")
+        if i + 1 < len(args):
+            try:
+                float(args[i + 1])
+                os.environ["QT_SCALE_FACTOR"] = args[i + 1]
+            except ValueError:
+                print(f"忽略无效 --dpi 值：{args[i + 1]}")
 
     app = QApplication(sys.argv[:1])
     app.setStyleSheet(QSS)
