@@ -215,6 +215,53 @@ pub fn init_logging(cfg: &ObservabilityConfig, override_level: Option<&str>) {
         .init();
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_counters() {
+        let stats = Stats::new();
+        stats.record_conn_start();
+        stats.record_bytes(100, 50);
+        let s = stats.snapshot();
+        assert_eq!(s.total_connections, 1);
+        assert_eq!(s.active_connections, 1);
+        assert_eq!(s.bytes_in, 100);
+        assert_eq!(s.bytes_out, 50);
+        stats.record_conn_end();
+        assert_eq!(stats.snapshot().active_connections, 0);
+        stats.record_error();
+        assert_eq!(stats.snapshot().errors, 1);
+    }
+
+    #[test]
+    fn per_outbound_counters() {
+        let stats = Stats::new();
+        stats.outbound_conn_start("socks5");
+        stats.outbound_bytes("socks5", 10, 20);
+        let mut list = stats.outbound_snapshot();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, "socks5");
+        assert_eq!(list[0].1.connections, 1);
+        assert_eq!(list[0].1.bytes_up, 10);
+        assert_eq!(list[0].1.bytes_down, 20);
+        stats.outbound_conn_end("socks5");
+        list = stats.outbound_snapshot();
+        assert_eq!(list[0].1.active, 0);
+        stats.outbound_error("socks5");
+        assert_eq!(stats.outbound_snapshot()[0].1.errors, 1);
+    }
+
+    #[test]
+    fn format_bytes_human() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(2048), "2.00 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+    }
+}
+
 /// 持有文件日志 worker guard，确保缓冲日志在进程退出前被刷盘。
 static FILE_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 

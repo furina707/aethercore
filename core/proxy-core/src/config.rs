@@ -321,3 +321,111 @@ impl Config {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_tmp(name: &str, content: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(name);
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    #[test]
+    fn load_valid_minimal_config() {
+        let json = r#"{
+          "server": { "listeners": [ {"protocol":"http","bind":"0.0.0.0:8080"} ] },
+          "outbounds": [ {"name":"direct","protocol":"direct","target":"0.0.0.0:0"} ],
+          "routing": [ {"name":"r1","domain_suffix":["example.com"],"outbound":"direct"} ]
+        }"#;
+        let p = write_tmp("omni_cfg_valid.json", json);
+        let cfg = Config::load(&p).expect("valid config should load");
+        std::fs::remove_file(&p).ok();
+        assert_eq!(cfg.outbounds.len(), 1);
+        assert_eq!(cfg.outbounds[0].name, "direct");
+        // 默认值
+        assert_eq!(cfg.observability.log_level, "info");
+        assert!(cfg.observability.stats);
+        assert_eq!(cfg.observability.stats_interval_secs, 10);
+        assert!(cfg.health_check.is_none());
+        assert!(cfg.hot_reload_secs.is_none());
+        assert_eq!(cfg.routing[0].match_mode, MatchMode::Any);
+    }
+
+    #[test]
+    fn reject_missing_direct_outbound() {
+        let json = r#"{
+          "server": { "listeners": [] },
+          "outbounds": [ {"name":"x","protocol":"direct","target":"0.0.0.0:0"} ]
+        }"#;
+        let p = write_tmp("omni_cfg_nodirect.json", json);
+        let r = Config::load(&p);
+        std::fs::remove_file(&p).ok();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn reject_routing_undefined_outbound() {
+        let json = r#"{
+          "server": { "listeners": [] },
+          "outbounds": [ {"name":"direct","protocol":"direct","target":"0.0.0.0:0"} ],
+          "routing": [ {"name":"r1","outbound":"ghost"} ]
+        }"#;
+        let p = write_tmp("omni_cfg_ghost.json", json);
+        let r = Config::load(&p);
+        std::fs::remove_file(&p).ok();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn health_check_and_transparent_defaults() {
+        let json = r#"{
+          "server": { "listeners": [] },
+          "outbounds": [ {"name":"direct","protocol":"direct","target":"0.0.0.0:0"} ],
+          "health_check": {},
+          "transparent": { "wintun": { "subnet":"10.99.0.1/24","redirect_port":1080 } }
+        }"#;
+        let p = write_tmp("omni_cfg_def.json", json);
+        let cfg = Config::load(&p).expect("should load");
+        std::fs::remove_file(&p).ok();
+        let hc = cfg.health_check.expect("health_check present");
+        assert_eq!(hc.interval_secs, 10);
+        assert_eq!(hc.timeout_secs, 3);
+        assert_eq!(hc.max_failures, 3);
+        let w = cfg.transparent.unwrap().wintun.unwrap();
+        assert_eq!(w.adapter_name, "omni-proxy-tun");
+        assert_eq!(w.redirect_port, 1080);
+    }
+
+    #[test]
+    fn enum_discriminants_parse() {
+        let json = r#"{
+          "server": { "listeners": [
+            {"protocol":"https","bind":"0.0.0.0:8443","tls":true,
+             "auth":{"auth_type":"basic","username":"a","password":"b"}},
+            {"protocol":"socks","bind":"0.0.0.0:1080",
+             "auth":{"auth_type":"password","username":"a","password":"b"}}
+          ] },
+          "outbounds": [
+            {"name":"direct","protocol":"direct","target":"0.0.0.0:0"},
+            {"name":"s5","protocol":"socks5","target":"127.0.0.1:1088"},
+            {"name":"hp","protocol":"httpproxy","target":"127.0.0.1:3128"}
+          ]
+        }"#;
+        let p = write_tmp("omni_cfg_enum.json", json);
+        let cfg = Config::load(&p).expect("should load");
+        std::fs::remove_file(&p).ok();
+        assert_eq!(cfg.server.listeners[0].protocol, ListenerProtocol::Https);
+        assert_eq!(
+            cfg.server.listeners[0].auth.as_ref().unwrap().auth_type,
+            AuthType::Basic
+        );
+        assert_eq!(
+            cfg.server.listeners[1].auth.as_ref().unwrap().auth_type,
+            AuthType::Password
+        );
+        assert_eq!(cfg.outbounds[1].protocol, OutboundProtocol::Socks5);
+        assert_eq!(cfg.outbounds[2].protocol, OutboundProtocol::HttpProxy);
+    }
+}
