@@ -19,6 +19,13 @@ certs/
 log/
 *.log
 
+# ===== Python bytecode / caches =====
+__pycache__/
+*.pyc
+
+# ===== Temporary GUI preview screenshots =====
+gui-shot.png
+
 # ===== Third-party prebuilt binaries =====
 core/singbox-core/
 
