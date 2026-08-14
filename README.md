@@ -1,0 +1,34 @@
+# net — 代理工具集（双核心）
+
+本仓库包含两套**相互独立**、可按场景任选其一使用的代理核心：
+
+- **omni-proxy**：自研 Rust 代理核心（源码在 `core/proxy-core/`）
+- **sing-box**：第三方预编译代理（二进制在 `core/singbox-core/`）
+
+两者**互不调用、互不依赖**，只需根据需求选用其一即可。
+
+---
+
+## 1. omni-proxy（自研 · Rust）
+
+- 源码：`core/proxy-core/`（Cargo 项目，详见 `core/proxy-core/README.md`）
+- 配置：`proxy-config.json`（**JSON** 格式；二进制默认读取 `./proxy-config.json`）
+- 启动方式：
+  - 开发调试：`cd core/proxy-core && cargo run -- proxy-config.json`
+  - 生产（零参数）：`python launcher.py`（自动定位编译产物并传入配置）
+- 当前能力：HTTP/HTTPS/SOCKS4-5/DNS + TLS + 规则路由 + 配置热重载 + 健康检查故障转移 + PAC 透明代理。
+- 状态：v0.1.0，MVP 完成度较高；Wintun/WFP 透明代理、SOCKS5 UDP、Shadowsocks/Vmess 出站仍处部分/待实现。
+
+## 2. sing-box（预编译二进制）
+
+- 二进制：`core/singbox-core/sing-box.exe`（含 `libcronet.dll`）
+- 配置：`singbox-config.json`（由订阅地址 `sub` 生成，含节点清单与凭证，**不入库**）
+- 启动：`core/singbox-core/sing-box.exe run -c singbox-config.json`
+- 说明：成熟的第三方代理实现，按需选用，与 omni-proxy 无代码耦合。
+
+---
+
+## 说明
+
+- 两套核心各自独立运行，按场景选择其一。
+- 证书/私钥、构建产物、订阅凭证、日志、`.workbuddy/` 等已通过 `.gitignore` 排除，不进入版本库。
