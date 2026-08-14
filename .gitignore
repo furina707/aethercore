@@ -44,3 +44,9 @@ dist/
 # ===== WinUI 3 build outputs =====
 gui-winui/bin/
 gui-winui/obj/
+
+# ===== GUI runtime state / backups =====
+.gui-core
+cache.db
+*.bak-*
+web-shot*.png
