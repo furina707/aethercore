@@ -11,7 +11,7 @@
             <StackPanel Padding="18,16" Spacing="14" MaxWidth="1240" HorizontalAlignment="Center">
 
                 <!-- ===== 顶部全局栏 ===== -->
-                <Border Style="{StaticResource CardStyle}" Padding="16,12">
+                <Border x:Name="AppTitleBar" Style="{StaticResource CardStyle}" Padding="16,12">
                     <Grid ColumnSpacing="12">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto" />

@@ -10,6 +10,8 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
+using Microsoft.UI.Windowing;
+using Windows.Graphics;
 using Windows.UI;
 
 namespace OmniProxyGui;
@@ -63,6 +65,7 @@ public sealed partial class MainWindow : Window
         LoadSubSources();
         TailLog();
         ApplyCorePreference();
+        InitWindow();
 
         _pollTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
         _pollTimer.Tick += async (_, _) => await PollAsync();
@@ -71,6 +74,65 @@ public sealed partial class MainWindow : Window
         _logTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1.5) };
         _logTimer.Tick += (_, _) => TailLog();
         _logTimer.Start();
+        Closed += (_, _) => SaveWindowPlacement();
+    }
+
+    private string WindowPlacementFile => Path.Combine(_root, ".gui-window");
+
+    private void InitWindow()
+    {
+        var aw = AppWindow;
+        // 标题栏融入顶栏（可拖拽），界面更现代
+        ExtendsContentIntoTitleBar = true;
+        SetTitleBar(AppTitleBar);
+        // 恢复上次位置/大小；首次启动居中
+        var (x, y, w, h) = LoadWindowPlacement();
+        if (w > 0 && h > 0)
+        {
+            try { aw.MoveAndResize(new RectInt32(x, y, w, h)); } catch { CenterWindow(aw); }
+        }
+        else
+        {
+            CenterWindow(aw);
+        }
+    }
+
+    private void CenterWindow(AppWindow aw)
+    {
+        try
+        {
+            var area = DisplayArea.GetFromWindowId(aw.Id, DisplayAreaFallback.Primary).WorkArea;
+            var x = area.X + (area.Width - aw.Size.Width) / 2;
+            var y = area.Y + (area.Height - aw.Size.Height) / 2;
+            aw.Move(new PointInt32(Math.Max(area.X, x), Math.Max(area.Y, y)));
+        }
+        catch { }
+    }
+
+    private (int x, int y, int w, int h) LoadWindowPlacement()
+    {
+        try
+        {
+            if (!File.Exists(WindowPlacementFile)) return (0, 0, 0, 0);
+            using var doc = JsonDocument.Parse(File.ReadAllText(WindowPlacementFile));
+            var r = doc.RootElement;
+            return (r.GetProperty("x").GetInt32(), r.GetProperty("y").GetInt32(),
+                    r.GetProperty("w").GetInt32(), r.GetProperty("h").GetInt32());
+        }
+        catch { return (0, 0, 0, 0); }
+    }
+
+    private void SaveWindowPlacement()
+    {
+        try
+        {
+            var aw = AppWindow;
+            var p = aw.Position;
+            var sz = aw.Size;
+            File.WriteAllText(WindowPlacementFile,
+                JsonSerializer.Serialize(new { x = p.X, y = p.Y, w = sz.Width, h = sz.Height }));
+        }
+        catch { }
     }
 
     private string CorePrefFile => Path.Combine(_root, ".gui-core");
