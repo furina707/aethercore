@@ -40,3 +40,7 @@ dev-progress-report.html
 # ===== PyInstaller build outputs =====
 build/
 dist/
+
+# ===== WinUI 3 build outputs =====
+gui-winui/bin/
+gui-winui/obj/
