@@ -6,6 +6,7 @@ using System.Net.Http;
 using System.Text.Json;
 using System.Threading.Tasks;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Windows.UI;
@@ -58,7 +59,9 @@ public sealed partial class MainWindow : Window
 
         _root = FindRoot();
         RefreshNodes();
+        LoadSubSources();
         TailLog();
+        ApplyCorePreference();
 
         _pollTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
         _pollTimer.Tick += async (_, _) => await PollAsync();
@@ -68,6 +71,134 @@ public sealed partial class MainWindow : Window
         _logTimer.Tick += (_, _) => TailLog();
         _logTimer.Start();
     }
+
+    private string CorePrefFile => Path.Combine(_root, ".gui-core");
+
+    private void ApplyCorePreference()
+    {
+        // 记忆上次选择的核（omni / singbox）
+        string core = "omni";
+        try { core = File.ReadAllText(CorePrefFile).Trim(); } catch { }
+        if (core != "singbox") core = "omni";
+        if (core == "singbox") CoreSb.IsChecked = true; else CoreOmni.IsChecked = true;
+        ApplyCoreVisibility(core == "singbox");
+    }
+
+    private void Core_Checked(object sender, RoutedEventArgs e)
+    {
+        // XAML 中 IsChecked="True" 会在 InitializeComponent 期间触发 Checked，
+        // 此时控件字段尚未赋值，需跳过
+        if (OmniSection == null || SbSection == null) return;
+        if (sender is not RadioButton rb) return;
+        bool singbox = rb.Tag?.ToString() == "singbox";
+        ApplyCoreVisibility(singbox);
+        try { File.WriteAllText(CorePrefFile, singbox ? "singbox" : "omni"); } catch { }
+    }
+
+    private void ApplyCoreVisibility(bool singbox)
+    {
+        OmniSection.Visibility = singbox ? Visibility.Collapsed : Visibility.Visible;
+        SbSection.Visibility = singbox ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    // ===== 订阅源选择 =====
+    private void LoadSubSources()
+    {
+        var sub = Path.Combine(_root, "sub");
+        if (!File.Exists(sub)) return;
+        foreach (var line in File.ReadAllLines(sub))
+        {
+            var s = line.Trim();
+            if (s.StartsWith("http")) SubSource.Items.Add(s);
+        }
+        if (SubSource.Items.Count > 0) SubSource.SelectedIndex = 0;
+    }
+
+    private async void SubUpdate_Click(object sender, RoutedEventArgs e)
+    {
+        BtnSub.IsEnabled = false;
+        BtnSub.Content = "更新中…";
+        // 选中了某个订阅源 → 仅更新该源；否则全部
+        var url = SubSource.SelectedItem as string;
+        if (!string.IsNullOrEmpty(url))
+            await RunPyAsync("update_subscription.py", "--url", url);
+        else
+            await RunPyAsync("update_subscription.py");
+        BtnSub.IsEnabled = true;
+        BtnSub.Content = "更新该订阅";
+        RefreshNodes();
+    }
+
+    private async void SubUpdateAll_Click(object sender, RoutedEventArgs e) => await RunPyAsync("update_subscription.py");
+
+    // ===== 节点选择 / 设为默认 =====
+    private void NodeList_SelectionChanged(object sender, Microsoft.UI.Xaml.Controls.SelectionChangedEventArgs e)
+    {
+        BtnSetDefault.IsEnabled = NodeList.SelectedItem != null;
+    }
+
+    private void SetDefaultNode_Click(object sender, RoutedEventArgs e)
+    {
+        if (NodeList.SelectedItem is not NodeRow node) return;
+        var cfg = Path.Combine(_root, "singbox-config.json");
+        if (!File.Exists(cfg)) { SbOutput.Text = "未找到 singbox-config.json"; return; }
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(cfg));
+            var outbounds = doc.RootElement.GetProperty("outbounds");
+            // 找到 "🚀节点选择" selector，把选中节点 tag 置顶（作为默认出口）
+            var nodeTag = node.Tag;
+            var list = new System.Collections.Generic.List<object>();
+            bool done = false;
+            foreach (var ob in outbounds.EnumerateArray())
+            {
+                var tag = ob.TryGetProperty("tag", out var t) ? t.GetString() : "";
+                var type = ob.TryGetProperty("type", out var ty) ? ty.GetString() : "";
+                if (type == "selector" && tag == "🚀节点选择")
+                {
+                    var outs = new System.Collections.Generic.List<string>();
+                    foreach (var o in ob.GetProperty("outbounds").EnumerateArray())
+                        outs.Add(o.GetString()!);
+                    outs.Remove(nodeTag);
+                    outs.Insert(0, nodeTag);   // 默认取第一个
+                    list.Add(new
+                    {
+                        type = "selector",
+                        tag = "🚀节点选择",
+                        interrupt_exist_connections = ob.TryGetProperty("interrupt_exist_connections", out var ie) && ie.GetBoolean(),
+                        outbounds = outs,
+                    });
+                    done = true;
+                    continue;
+                }
+                list.Add(JsonElementToObject(ob));
+            }
+            if (!done) { SbOutput.Text = "未找到 🚀节点选择 selector"; return; }
+
+            // 组装回原结构并写文件（备份后写）
+            using var root = JsonDocument.Parse(File.ReadAllText(cfg));
+            var props = new System.Collections.Generic.Dictionary<string, object>();
+            foreach (var pr in root.RootElement.EnumerateObject())
+                props[pr.Name] = pr.Value.ValueKind == JsonValueKind.Array
+                    ? (object)System.Linq.Enumerable.ToList(JsonElementToObjectList(pr.Value))
+                    : JsonElementToObject(pr.Value);
+            props["outbounds"] = list;
+
+            var bak = cfg + $".bak-{DateTime.Now:yyyyMMdd-HHmmss}";
+            File.Copy(cfg, bak, true);
+            File.WriteAllText(cfg, JsonSerializer.Serialize(props, new JsonSerializerOptions { WriteIndented = true }));
+            SbOutput.Text = $"已设为默认节点：{nodeTag}\n（原配置已备份为 {Path.GetFileName(bak)}）";
+        }
+        catch (Exception ex) { SbOutput.Text = $"设置默认节点失败：{ex.Message}"; }
+    }
+
+    private static object JsonElementToObject(JsonElement el) => el.Clone();
+
+    private static System.Collections.Generic.IEnumerable<object> JsonElementToObjectList(JsonElement arr)
+    {
+        foreach (var x in arr.EnumerateArray()) yield return x.Clone();
+    }
+
 
     private static string FindRoot()
     {
@@ -237,15 +368,6 @@ public sealed partial class MainWindow : Window
         SbStatus.Text = "未运行";
     }
 
-    private async void SubUpdate_Click(object sender, RoutedEventArgs e)
-    {
-        BtnSub.IsEnabled = false;
-        BtnSub.Content = "更新中…";
-        await RunPyAsync("update_subscription.py");
-        BtnSub.IsEnabled = true;
-        BtnSub.Content = "更新订阅";
-        RefreshNodes();
-    }
 
     private async void SbVersion_Click(object sender, RoutedEventArgs e) => await RunPyAsync("update_singbox.py", "--check");
 

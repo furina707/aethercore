@@ -29,12 +29,18 @@
                             <TextBlock Text="omni-proxy / sing-box · 单页平铺 · 无分页" FontSize="11"
                                        Foreground="{StaticResource WeakBrush}" />
                         </StackPanel>
-                        <TextBlock Grid.Column="2" Text="扁平 · 圆润" VerticalAlignment="Center"
-                                   FontSize="11" Foreground="{StaticResource WeakBrush}" />
+                        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+                            <RadioButton x:Name="CoreOmni" Content="omni-proxy" GroupName="core" Tag="omni"
+                                         IsChecked="True" Checked="Core_Checked"
+                                         Foreground="{StaticResource InkBrush}" />
+                            <RadioButton x:Name="CoreSb" Content="sing-box" GroupName="core" Tag="singbox"
+                                         Checked="Core_Checked" Foreground="{StaticResource InkBrush}" />
+                        </StackPanel>
                     </Grid>
                 </Border>
 
-                <TextBlock Text="omni-proxy 核心" Style="{StaticResource DividerTitle}" />
+                <StackPanel x:Name="OmniSection">
+<TextBlock Text="omni-proxy 核心" Style="{StaticResource DividerTitle}" />
 
                 <!-- ===== omni 状态条 ===== -->
                 <Border Style="{StaticResource CardStyle}" Padding="16,12">
@@ -198,7 +204,9 @@
                     </StackPanel>
                 </Border>
 
-                <TextBlock Text="sing-box 节点" Style="{StaticResource DividerTitle}" />
+                </StackPanel>
+<StackPanel x:Name="SbSection">
+<TextBlock Text="sing-box 节点" Style="{StaticResource DividerTitle}" />
 
                 <!-- ===== sing-box 状态条 ===== -->
                 <Border Style="{StaticResource CardStyle}" Padding="16,12">
@@ -211,7 +219,7 @@
                         <Ellipse x:Name="SbDot" Grid.Column="0" Width="10" Height="10" Fill="#4A5568" VerticalAlignment="Center" />
                         <TextBlock x:Name="SbStatus" Grid.Column="1" VerticalAlignment="Center" FontSize="12.5"
                                    Foreground="{StaticResource SubBrush}" TextTrimming="CharacterEllipsis" />
-                        <Button x:Name="BtnSub" Grid.Column="2" Content="更新订阅" Style="{StaticResource FlatButton}" MinWidth="88" Click="SubUpdate_Click" />
+                        <Button x:Name="BtnSubAll" Grid.Column="2" Content="更新全部订阅" Style="{StaticResource FlatButton}" MinWidth="100" Click="SubUpdateAll_Click" />
                         <Button x:Name="BtnSbVersion" Grid.Column="3" Content="检查/更新版本" Style="{StaticResource FlatButton}" MinWidth="110" Click="SbVersion_Click" />
                         <Button x:Name="BtnSbStop" Grid.Column="4" Content="停止" Style="{StaticResource DangerButton}" MinWidth="64" IsEnabled="False" Click="SbStop_Click" />
                         <Button x:Name="BtnSbStart" Grid.Column="5" Content="启动 sing-box" Style="{StaticResource PrimaryButton}" Click="SbStart_Click" />
@@ -230,7 +238,7 @@
                             <TextBlock Grid.Column="2" Text="服务器" Style="{StaticResource Th}" /><TextBlock Grid.Column="3" Text="端口" Style="{StaticResource Th}" />
                         </Grid>
                         <Border Height="1" Background="{StaticResource LineBrush}" />
-                        <ListView x:Name="NodeList" MaxHeight="240" SelectionMode="None">
+                        <ListView x:Name="NodeList" MaxHeight="220" SelectionMode="Single" IsItemClickEnabled="True" SelectionChanged="NodeList_SelectionChanged">
                             <ListView.ItemTemplate>
                                 <DataTemplate>
                                     <Grid>
@@ -245,6 +253,14 @@
                                 </DataTemplate>
                             </ListView.ItemTemplate>
                         </ListView>
+                        <StackPanel Orientation="Horizontal" Spacing="10" Margin="0,12,0,0">
+                            <ComboBox x:Name="SubSource" MinWidth="260" PlaceholderText="订阅源（sub 文件）"
+                                      FontSize="12.5" />
+                            <Button x:Name="BtnSub" Content="更新该订阅" Style="{StaticResource PrimaryButton}"
+                                    Click="SubUpdate_Click" />
+                            <Button x:Name="BtnSetDefault" Content="设为默认节点" Style="{StaticResource FlatButton}"
+                                    IsEnabled="False" Click="SetDefaultNode_Click" />
+                        </StackPanel>
                     </StackPanel>
                 </Border>
 
@@ -259,7 +275,8 @@
                     </StackPanel>
                 </Border>
 
-                <TextBlock Text="工具链" Style="{StaticResource DividerTitle}" />
+                </StackPanel>
+<TextBlock Text="工具链" Style="{StaticResource DividerTitle}" />
 
                 <!-- ===== 入口 ===== -->
                 <Border Style="{StaticResource CardStyle}">
