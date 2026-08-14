@@ -23,9 +23,23 @@
 body{
   font-family:Inter,"Segoe UI",-apple-system,"Microsoft YaHei UI","PingFang SC","Microsoft YaHei",sans-serif;
   font-size:13px; color:var(--ink); line-height:1.65;
-  background:var(--bg); padding:16px; overflow:hidden;
+  background:var(--bg); padding:18px;
 }
-.app{display:flex; gap:16px; height:calc(100vh - 32px);}
+.wrap{max-width:1240px; margin:0 auto; display:flex; flex-direction:column; gap:14px}
+/* 分区标题（平铺分隔） */
+.divider{
+  display:flex; align-items:center; gap:10px; margin:6px 0 -4px;
+  font-size:13px; font-weight:700; letter-spacing:.3px; color:var(--sub);
+}
+.divider::after{content:""; flex:1; height:1px; background:var(--line)}
+/* 全局顶栏 */
+.topbar-global{display:flex; align-items:center; gap:12px}
+.topbar-global .logo{width:36px;height:36px;border-radius:12px;background:var(--primary);color:#fff;
+  display:flex;align-items:center;justify-content:center;font-weight:800;font-size:15px;flex:none}
+.topbar-global h1{font-size:17px; letter-spacing:.3px}
+.topbar-global .v{font-size:11px;color:var(--weak);font-weight:400}
+.topbar-global .spacer{flex:1}
+.panel{display:flex; flex-direction:column; gap:14px}
 
 /* ===== 导航 ===== */
 .nav{
@@ -51,8 +65,7 @@ body{
 
 /* ===== 主区 ===== */
 .main{flex:1; min-width:0; display:flex; flex-direction:column; gap:14px; overflow-y:auto; padding:2px 4px 12px}
-.panel{display:none; flex-direction:column; gap:14px; min-height:100%}
-.panel.on{display:flex}
+.panel{display:flex; flex-direction:column; gap:14px; min-height:0}
 
 /* ===== 卡片 ===== */
 .card{
@@ -136,25 +149,21 @@ code{background:#1e2431; border:1px solid var(--line); border-radius:8px; paddin
 </style>
 </head>
 <body>
-<div class="app">
-  <!-- ===== 导航 ===== -->
-  <aside class="nav">
-    <div class="brand">
+<div class="wrap">
+  <div class="card" style="padding:14px 20px">
+    <div class="topbar-global">
       <div class="logo">om</div>
-      <b>代理工具<span>omni-proxy / sing-box</span></b>
+      <h1>代理工具控制台 <span class="v">omni-proxy / sing-box</span></h1>
+      <span class="spacer"></span>
+      <span class="muted">单页平铺 · 无分页</span>
     </div>
-    <div class="item active" data-tab="omni">omni-proxy 核心</div>
-    <div class="item" data-tab="singbox">sing-box 节点</div>
-    <div class="item" data-tab="tools">工具链</div>
-    <div class="spacer"></div>
-    <div class="hint">Ctrl+1 / 2 / 3 切换</div>
-  </aside>
-
+  </div>
+  <div class="divider">omni-proxy 核心</div>
   <!-- ===== 主区 ===== -->
-  <main class="main">
+  
 
     <!-- ===== omni-proxy 页 ===== -->
-    <section class="panel on" id="panel-omni">
+    <section class="panel" id="panel-omni">
       <div class="card">
         <div class="topbar">
           <span class="dot"></span>
@@ -187,7 +196,8 @@ code{background:#1e2431; border:1px solid var(--line); border-radius:8px; paddin
     </section>
 
     <!-- ===== sing-box 页 ===== -->
-    <section class="panel" id="panel-singbox">
+    <div class="divider">sing-box 节点</div>
+      <section class="panel" id="panel-singbox">
       <div class="card">
         <div class="topbar">
           <span class="dot gray"></span>
@@ -215,7 +225,8 @@ code{background:#1e2431; border:1px solid var(--line); border-radius:8px; paddin
     </section>
 
     <!-- ===== 工具链页 ===== -->
-    <section class="panel" id="panel-tools">
+    <div class="divider">工具链</div>
+      <section class="panel" id="panel-tools">
       <div class="card">
         <div class="sec-title">入口</div>
         <div class="topbar" style="flex-wrap:wrap">
@@ -240,7 +251,7 @@ code{background:#1e2431; border:1px solid var(--line); border-radius:8px; paddin
 2026-08-14T23:10:15Z INFO proxy stats total=1301 active=5 in_mb=512 out_mb=1190 errors=3</div>
       </div>
     </section>
-  </main>
+  
 </div>
 
 <script>
@@ -299,16 +310,6 @@ function renderOmni(d){
 function renderNodes(nodes){
   document.getElementById("node-body").innerHTML=nodes.map(function(n){return "<tr><td><b>"+esc(n.tag)+"</b></td><td><code>"+esc(n.type)+"</code></td><td>"+esc(n.server)+"</td><td>"+n.port+"</td></tr>";}).join("");
 }
-
-/* ===== 页面切换 ===== */
-document.querySelectorAll(".nav .item").forEach(function(item){
-  item.addEventListener("click",function(){
-    document.querySelectorAll(".nav .item").forEach(function(i){i.classList.remove("active");});
-    document.querySelectorAll(".panel").forEach(function(p){p.classList.remove("on");});
-    item.classList.add("active");
-    document.getElementById("panel-"+item.dataset.tab).classList.add("on");
-  });
-});
 
 renderOmni(DEMO_STATUS);
 renderNodes(DEMO_NODES);

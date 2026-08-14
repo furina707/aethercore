@@ -31,8 +31,9 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFrame, QGraphicsDropShadowEffect, QGridLayout,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMenu,
-    QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QStackedWidget,
-    QSystemTrayIcon, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSplitter,
+    QStackedWidget, QSystemTrayIcon, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -143,6 +144,32 @@ QLabel#kpiV {
   font-size: 21px; font-weight: 800; color: #6b7aff;
 }
 QLabel#kpiL { font-size: 11px; color: #8d98ad; letter-spacing: .3px; }
+
+QLabel#divider {
+  font-size: 13px; font-weight: 700; color: #8d98ad;
+  letter-spacing: .3px; padding: 2px 0 4px;
+  border-bottom: 1px solid #232a3a;
+}
+QLabel#logo {
+  background: #6b7aff; color: #ffffff;
+  border-radius: 11px; font-weight: 800; font-size: 14px;
+}
+QScrollArea { background: transparent; border: none; }
+QScrollBar:horizontal { height: 0; }
+
+
+QLabel#divider {
+  font-size: 13px; font-weight: 700; color: #5f6c88;
+  letter-spacing: .3px; padding: 2px 0 4px;
+  border-bottom: 1px solid #e3e8f3;
+}
+QLabel#logo {
+  background: #4f5de0; color: #ffffff;
+  border-radius: 11px; font-weight: 800; font-size: 14px;
+}
+QScrollArea { background: transparent; border: none; }
+QScrollBar:horizontal { height: 0; }
+
 QLabel#secTitle {
   font-size: 14.5px; font-weight: 700; color: #e9edf7;
   padding-left: 12px;
@@ -949,6 +976,13 @@ class ToolsPage(QWidget):
 
 # ---------- 主窗口 ----------
 
+def _divider(text: str) -> QLabel:
+    """平铺布局的分隔标题（与 Web 版 .divider 一致）。"""
+    lb = QLabel(text)
+    lb.setObjectName("divider")
+    return lb
+
+
 class MainWindow(QMainWindow):
     def __init__(self, demo: bool = False, settings: QSettings | None = None, light: bool = False):
         super().__init__()
@@ -968,32 +1002,53 @@ class MainWindow(QMainWindow):
         if geo is not None:
             self.restoreGeometry(geo)
 
+        # 单页平铺布局（无分页/标签切换）：滚动区包含顶部全局栏 + 各区分隔 + 三页内容
         central = QWidget()
         self.setCentralWidget(central)
-        root_lay = QHBoxLayout(central)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        outer.addWidget(scroll)
+        inner = QWidget()
+        scroll.setWidget(inner)
+        root_lay = QVBoxLayout(inner)
         root_lay.setContentsMargins(14, 14, 14, 14)
         root_lay.setSpacing(14)
 
-        self.nav = QListWidget()
-        self.nav.setObjectName("nav")
-        self.nav.setFixedWidth(180)
-        # 不加 soften()：QListWidget 在真实桌面加 graphics effect 会破坏 QSS 渲染
-        for name in ("omni-proxy 核心", "sing-box 节点", "工具链"):
-            item = QListWidgetItem(name)
-            item.setSizeHint(item.sizeHint())
-            self.nav.addItem(item)
+        # 顶部全局栏
+        head = QFrame()
+        head.setObjectName("card")
+        h_lay = QHBoxLayout(head)
+        h_lay.setContentsMargins(14, 10, 14, 10)
+        logo = QLabel("om")
+        logo.setObjectName("logo")  # 可在 QSS 单独配置
+        logo.setAlignment(Qt.AlignCenter)
+        logo.setFixedSize(34, 34)
+        title = QLabel("代理工具控制台  omni-proxy / sing-box")
+        title.setStyleSheet("font-weight:700; font-size:14px;")
+        h_lay.addWidget(logo)
+        h_lay.addWidget(title)
+        h_lay.addStretch(1)
+        hint = QLabel("单页平铺 · 无分页")
+        hint.setStyleSheet("color:#67748f; font-size:11px;")
+        h_lay.addWidget(hint)
+        root_lay.addWidget(head)
 
-        self.stack = QStackedWidget()
-        self.pages = [OmniPage(demo=demo), SingboxPage(demo=demo), ToolsPage()]
-        for p in self.pages:
-            self.stack.addWidget(p)
-
-        root_lay.addWidget(self.nav)
-        root_lay.addWidget(self.stack, 1)
-
-        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
-        # 恢复上次浏览的页面
-        self.nav.setCurrentRow(int(self._settings.value("page", 0)))
+        # 各区平铺
+        self.omni_page = OmniPage(demo=demo)
+        root_lay.addWidget(_divider("omni-proxy 核心"))
+        root_lay.addWidget(self.omni_page)
+        self.singbox_page = SingboxPage(demo=demo)
+        root_lay.addWidget(_divider("sing-box 节点"))
+        root_lay.addWidget(self.singbox_page)
+        self.tools_page = ToolsPage()
+        root_lay.addWidget(_divider("工具链"))
+        root_lay.addWidget(self.tools_page)
+        root_lay.addStretch(1)
 
         # 状态栏：主题切换按钮（常驻）
         self.btn_theme = QPushButton("浅色" if self._light else "深色")
@@ -1003,11 +1058,6 @@ class MainWindow(QMainWindow):
         self.btn_theme.clicked.connect(self.toggle_theme)
         self.statusBar().addPermanentWidget(self.btn_theme)
         self.statusBar().showMessage(f"工作目录：{ROOT} · 初始化…")
-
-        # 快捷键：Ctrl+1/2/3 切换页面
-        for i, key in enumerate(("1", "2", "3")):
-            QShortcut(QKeySequence(f"Ctrl+{key}"), self,
-                      lambda i=i: self.nav.setCurrentRow(i))
 
         self._init_tray()
 
@@ -1117,7 +1167,7 @@ class MainWindow(QMainWindow):
             ev.ignore()
             self.hide()
             return
-        for p in self.pages:
+        for p in (self.omni_page, self.singbox_page, self.tools_page):
             p.closeEvent(ev)
         self._save_state()
         super().closeEvent(ev)
@@ -1125,7 +1175,6 @@ class MainWindow(QMainWindow):
     def _save_state(self):
         s = self._settings
         s.setValue("geometry", self.saveGeometry())
-        s.setValue("page", self.nav.currentRow())
         s.setValue("theme", "light" if self._light else "dark")
         s.sync()
 
