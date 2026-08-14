@@ -131,6 +131,32 @@ pub struct Listener {
     /// 透明代理模式需要的真实目标获取方式（仅 TCP/UDP 透明）
     #[serde(default)]
     pub transparent: bool,
+    /// 认证配置（HTTP/SOCKS 代理用）
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
+}
+
+/// 认证配置。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthConfig {
+    /// 认证类型：basic（HTTP）/ password（SOCKS）
+    #[serde(default = "default_auth_type")]
+    pub auth_type: AuthType,
+    /// 用户名
+    pub username: String,
+    /// 密码
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthType {
+    Basic,
+    Password,
+}
+
+fn default_auth_type() -> AuthType {
+    AuthType::Basic
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -169,7 +195,31 @@ pub struct Outbound {
     /// TLS 主机名（SNI）
     #[serde(default)]
     pub sni: Option<String>,
+    /// 认证信息（上游代理需要认证时）
+    #[serde(default)]
+    pub auth: Option<OutboundAuth>,
+    /// 连接池大小（0=禁用）
+    #[serde(default)]
+    pub pool_size: usize,
+    /// 重试次数
+    #[serde(default = "default_retries")]
+    pub retries: u32,
+    /// 超时时间（秒）
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u64,
 }
+
+/// 出站认证配置。
+#[derive(Debug, Clone, Deserialize)]
+pub struct OutboundAuth {
+    /// 用户名
+    pub username: String,
+    /// 密码
+    pub password: String,
+}
+
+fn default_retries() -> u32 { 0 }
+fn default_timeout() -> u64 { 10 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -180,6 +230,10 @@ pub enum OutboundProtocol {
     Socks5,
     /// 经上游 HTTP(S) 代理
     HttpProxy,
+    /// 经上游 Shadowsocks 代理
+    Shadowsocks,
+    /// 经上游 Vmess 代理
+    Vmess,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -222,6 +276,13 @@ pub struct ObservabilityConfig {
     /// 统计采样间隔（秒）
     #[serde(default = "default_stats_interval")]
     pub stats_interval_secs: u64,
+    /// 连接空闲超时（秒）：双向无数据流动超过该值则关闭连接，0 = 使用默认 300s
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+    /// 日志文件目录（相对 cwd 或绝对路径），默认 "log"。
+    /// 同时写入控制台与该目录下的滚动日志文件（按天滚动，omni-proxy-YYYY-MM-DD.log）。
+    #[serde(default = "default_log_dir")]
+    pub log_dir: String,
 }
 
 fn default_log_level() -> String {
@@ -233,11 +294,15 @@ fn default_true() -> bool {
 fn default_stats_interval() -> u64 {
     10
 }
+fn default_log_dir() -> String {
+    "log".into()
+}
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let cfg: Config = serde_yaml::from_str(&content)?;
+        let cfg: Config = serde_json::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("JSON 配置解析失败 ({}): {}", path.display(), e))?;
         cfg.validate()?;
         Ok(cfg)
     }

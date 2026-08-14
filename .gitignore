@@ -1,18 +1,31 @@
-# Rust build artifacts
+# ===== Rust build artifacts =====
+/target/
 target/
 **/target/
 
-# Large ISO / disk images
-*.iso
+# compiler / linker outputs
+*.pdb
+*.exe
+*.dll
+*.rmeta
+*.rlib
 
-# Build / run logs
+# ===== Secrets / certificates (regenerable via `cargo run --example gen_cert`) =====
+certs/
+*.key
+*.crt
+
+# ===== Runtime logs =====
+log/
 *.log
-proxy.out
-proxy.err
 
-# RVM emulator outputs
-*.rvm
+# ===== Third-party prebuilt binaries =====
+core/singbox-core/
 
-# OS / editor
-.DS_Store
-Thumbs.db
+# ===== Sensitive subscription credentials =====
+singbox-config.json
+sub
+
+# ===== WorkBuddy internal / analysis artifacts =====
+.workbuddy/
+dev-progress-report.html

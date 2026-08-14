@@ -43,6 +43,21 @@ impl ProxyState {
         self.config.load_full()
     }
 
+    /// 取当前生效的连接空闲超时。优先用 observability.idle_timeout_secs，
+    /// 未配置或为 0 时回退到 relay 模块的默认值（300s）。
+    pub fn idle_timeout(&self) -> std::time::Duration {
+        let cfg = self.config();
+        match cfg.observability.idle_timeout_secs {
+            Some(s) if s > 0 => std::time::Duration::from_secs(s),
+            _ => std::time::Duration::from_secs(crate::relay::default_idle_timeout_secs()),
+        }
+    }
+
+    /// 获取健康状态映射的只读引用（用于 UI/API）。
+    pub async fn get_health(&self) -> tokio::sync::RwLockReadGuard<HashMap<String, Health>> {
+        self.health.read().await
+    }
+
     /// 原子热替换配置（外部热重载任务调用）。
     pub fn reload(&self, cfg: Config) {
         // 合并健康状态：保留既有记录，新增链路默认存活
@@ -52,6 +67,12 @@ impl ProxyState {
                 map.entry(ob.name.clone()).or_insert(Health { alive: true, ..Default::default() });
             }
         });
+        tracing::info!(
+            listeners = cfg.server.listeners.len(),
+            outbounds = cfg.outbounds.len(),
+            routes = cfg.routing.len(),
+            "ProxyState 配置已原子替换"
+        );
         self.config.store(Arc::new(cfg));
     }
 
@@ -59,6 +80,7 @@ impl ProxyState {
     pub async fn report_health(&self, name: &str, ok: bool) {
         let mut map = self.health.write().await;
         let e = map.entry(name.to_string()).or_default();
+        let was_alive = e.alive;
         if ok {
             e.alive = true;
             e.consecutive_failures = 0;
@@ -69,6 +91,18 @@ impl ProxyState {
             }
         }
         e.last_checked = Some(Instant::now());
+        // 仅在状态切换时打印 info，避免周期性刷屏
+        if was_alive != e.alive {
+            if e.alive {
+                tracing::info!(outbound = %name, "健康状态切换：dead -> alive");
+            } else {
+                tracing::warn!(
+                    outbound = %name,
+                    consecutive_failures = e.consecutive_failures,
+                    "健康状态切换：alive -> dead"
+                );
+            }
+        }
     }
 
     /// 选择出站链路名：先按路由规则，命中死链则回退到任意存活链路，
@@ -81,6 +115,13 @@ impl ProxyState {
             return chosen;
         }
         // 故障转移：在同协议出站中挑一个存活的
+        tracing::warn!(
+            chosen = %chosen,
+            req_domain = ?req.domain,
+            req_ip = ?req.ip,
+            req_port = req.port,
+            "选中出站链路处于不可用状态，触发故障转移"
+        );
         if let Some(ob) = cfg.outbounds.iter().find(|o| o.name == chosen) {
             let proto = ob.protocol;
             if let Some(fb) = cfg
@@ -88,9 +129,21 @@ impl ProxyState {
                 .iter()
                 .find(|o| o.protocol == proto && health.get(&o.name).map(|h| h.alive).unwrap_or(true))
             {
+                tracing::info!(
+                    from = %chosen,
+                    to = %fb.name,
+                    protocol = ?proto,
+                    "故障转移：切换到同协议存活链路"
+                );
                 return fb.name.clone();
             }
+            tracing::warn!(
+                from = %chosen,
+                protocol = ?proto,
+                "故障转移失败：无同协议存活链路"
+            );
         }
+        tracing::warn!(from = %chosen, "故障转移失败：回退 direct");
         "direct".to_string()
     }
 
@@ -99,10 +152,18 @@ impl ProxyState {
         let cfg = self.config();
         let hc: HealthCheckConfig = match &cfg.health_check {
             Some(h) => h.clone(),
-            None => return, // 未启用健康探测
+            None => {
+                tracing::info!("健康探测循环退出：未配置 health_check");
+                return;
+            }
         };
         let interval = Duration::from_secs(hc.interval_secs.max(1));
         let timeout = Duration::from_secs(hc.timeout_secs.max(1));
+        tracing::info!(
+            interval_secs = interval.as_secs(),
+            timeout_secs = timeout.as_secs(),
+            "健康探测循环开始"
+        );
         loop {
             let cfg = self.config();
             for ob in &cfg.outbounds {
@@ -111,7 +172,12 @@ impl ProxyState {
                 }
                 let ok = probe(ob, timeout).await;
                 self.report_health(&ob.name, ok).await;
-                tracing::debug!("健康探测 {} -> {}", ob.name, if ok { "alive" } else { "dead" });
+                tracing::debug!(
+                    outbound = %ob.name,
+                    target = %ob.target,
+                    alive = ok,
+                    "健康探测完成"
+                );
             }
             tokio::time::sleep(interval).await;
         }

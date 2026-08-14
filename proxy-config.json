@@ -1,0 +1,157 @@
+{
+  "server": {
+    "listeners": [
+      {
+        "protocol": "http",
+        "bind": "0.0.0.0:8080",
+        "tls": false,
+        "transparent": false,
+        "auth": null
+      },
+      {
+        "protocol": "https",
+        "bind": "0.0.0.0:8443",
+        "tls": true,
+        "transparent": false,
+        "auth": {
+          "auth_type": "basic",
+          "username": "admin",
+          "password": "secret"
+        }
+      },
+      {
+        "protocol": "socks",
+        "bind": "0.0.0.0:1080",
+        "tls": false,
+        "transparent": false,
+        "auth": {
+          "auth_type": "password",
+          "username": "admin",
+          "password": "secret"
+        }
+      },
+      {
+        "protocol": "tcp",
+        "bind": "0.0.0.0:9999",
+        "tls": false,
+        "transparent": true,
+        "auth": null
+      },
+      {
+        "protocol": "udp",
+        "bind": "0.0.0.0:9998",
+        "tls": false,
+        "transparent": true,
+        "auth": null
+      },
+      {
+        "protocol": "dns",
+        "bind": "0.0.0.0:53",
+        "tls": false,
+        "transparent": false,
+        "auth": null
+      }
+    ]
+  },
+  "tls": {
+    "cert": "C:\\Users\\cytFu\\Desktop\\net\\core\\proxy-core\\certs\\server.crt",
+    "key": "C:\\Users\\cytFu\\Desktop\\net\\core\\proxy-core\\certs\\server.key",
+    "client_ca": null
+  },
+  "outbounds": [
+    {
+      "name": "direct",
+      "protocol": "direct",
+      "target": "0.0.0.0:0",
+      "tls": false,
+      "sni": null,
+      "auth": null,
+      "pool_size": 0,
+      "retries": 0,
+      "timeout_secs": 10
+    },
+    {
+      "name": "via-socks5",
+      "protocol": "socks5",
+      "target": "127.0.0.1:1088",
+      "tls": false,
+      "sni": null,
+      "auth": null,
+      "pool_size": 0,
+      "retries": 3,
+      "timeout_secs": 10
+    },
+    {
+      "name": "via-http",
+      "protocol": "httpproxy",
+      "target": "127.0.0.1:3128",
+      "tls": false,
+      "sni": null,
+      "auth": null,
+      "pool_size": 0,
+      "retries": 3,
+      "timeout_secs": 10
+    },
+    {
+      "name": "dns",
+      "protocol": "direct",
+      "target": "8.8.8.8:53",
+      "tls": false,
+      "sni": null,
+      "auth": null,
+      "pool_size": 0,
+      "retries": 0,
+      "timeout_secs": 10
+    }
+  ],
+  "routing": [
+    {
+      "name": "内网直连",
+      "domain_suffix": ["internal.example.com", "corp.local"],
+      "ip_cidr": [],
+      "port": [],
+      "match_mode": "any",
+      "outbound": "direct"
+    },
+    {
+      "name": "特殊端口走SOCKS5",
+      "domain_suffix": [],
+      "ip_cidr": [],
+      "port": [22, 3389],
+      "match_mode": "any",
+      "outbound": "via-socks5"
+    },
+    {
+      "name": "特定网段走HTTP",
+      "domain_suffix": [],
+      "ip_cidr": ["192.168.0.0/16"],
+      "port": [],
+      "match_mode": "any",
+      "outbound": "via-http"
+    }
+  ],
+  "observability": {
+    "log_level": "info",
+    "stats": true,
+    "stats_interval_secs": 10,
+    "idle_timeout_secs": 300,
+    "log_dir": "log"
+  },
+  "hot_reload_secs": 5,
+  "health_check": {
+    "interval_secs": 10,
+    "timeout_secs": 3,
+    "max_failures": 3
+  },
+  "transparent": {
+    "pac": {
+      "bind": "127.0.0.1:15080",
+      "proxy": "PROXY 127.0.0.1:8080; SOCKS5 127.0.0.1:1080",
+      "set_system_proxy": false,
+      "proxy_ports": [80, 443],
+      "bypass_domains": ["internal.example.com", "corp.local"]
+    },
+    "wintun": null,
+    "wfp": null
+  }
+}

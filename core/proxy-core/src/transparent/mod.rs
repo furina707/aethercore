@@ -15,27 +15,36 @@ use crate::state::ProxyState;
 pub async fn run_transparent(cfg: &TransparentConfig, state: Arc<ProxyState>) -> Result<()> {
     if let Some(pac) = &cfg.pac {
         let pac = pac.clone();
+        tracing::info!(scheme = "pac", bind = ?pac.bind, "透明代理方案 1（PAC）启动中");
         tokio::spawn(async move {
             if let Err(e) = pac::run_pac(&pac).await {
-                tracing::error!("PAC 服务异常: {:?}", e);
+                tracing::error!(scheme = "pac", error = ?e, "PAC 服务异常退出");
             }
         });
+    } else {
+        tracing::info!(scheme = "pac", "PAC 方案未配置，跳过");
     }
     if let Some(wfp) = &cfg.wfp {
         let wfp = wfp.clone();
+        tracing::info!(scheme = "wfp", "透明代理方案 3（WFP）启动中（需管理员 + callout 驱动）");
         tokio::spawn(async move {
             if let Err(e) = wfp::run_wfp(&wfp).await {
-                tracing::error!("WFP 重定向异常: {:?}", e);
+                tracing::error!(scheme = "wfp", error = ?e, "WFP 重定向异常退出");
             }
         });
+    } else {
+        tracing::info!(scheme = "wfp", "WFP 方案未配置，跳过");
     }
     if let Some(wt) = &cfg.wintun {
         let wt = wt.clone();
+        tracing::info!(scheme = "wintun", adapter = ?wt.adapter_name, redirect_port = ?wt.redirect_port, "透明代理方案 2（Wintun TUN）启动中（需管理员 + wintun.dll）");
         tokio::spawn(async move {
             if let Err(e) = wintun_tun::run_wintun(&wt, state.clone()).await {
-                tracing::error!("Wintun 异常: {:?}", e);
+                tracing::error!(scheme = "wintun", error = ?e, "Wintun 异常退出");
             }
         });
+    } else {
+        tracing::info!(scheme = "wintun", "Wintun 方案未配置，跳过");
     }
     Ok(())
 }
