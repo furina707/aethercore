@@ -82,9 +82,13 @@ public sealed partial class MainWindow : Window
     private void InitWindow()
     {
         var aw = AppWindow;
-        // 标题栏融入顶栏（可拖拽），界面更现代
-        ExtendsContentIntoTitleBar = true;
-        SetTitleBar(AppTitleBar);
+        // 标题栏融入顶栏（可拖拽），界面更现代；失败仅降级默认标题栏
+        try
+        {
+            ExtendsContentIntoTitleBar = true;
+            SetTitleBar(AppTitleBar);
+        }
+        catch { }
         // 恢复上次位置/大小；首次启动居中
         var (x, y, w, h) = LoadWindowPlacement();
         if (w > 0 && h > 0)
