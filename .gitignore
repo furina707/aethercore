@@ -50,3 +50,6 @@ gui-winui/obj/
 cache.db
 *.bak-*
 web-shot*.png
+.gui-window
+.gui-theme
+.gui-crash.log
