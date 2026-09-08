@@ -1,0 +1,1 @@
+# AetherCore - Pure Python Core Package

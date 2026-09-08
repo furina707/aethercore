@@ -1,55 +1,26 @@
-# ===== Rust build artifacts =====
-/target/
-target/
-**/target/
+# AetherCore .gitignore
 
-# compiler / linker outputs
-*.pdb
+# C 编译产物
+*.obj
 *.exe
-*.dll
-*.rmeta
-*.rlib
+*.pdb
+*.ilk
+*.exp
+*.lib
 
-# ===== Secrets / certificates (regenerable via `cargo run --example gen_cert`) =====
-certs/
-*.key
-*.crt
-
-# ===== Runtime logs =====
-log/
-*.log
-
-# ===== Python bytecode / caches =====
+# Python 缓存
 __pycache__/
 *.pyc
 
-# ===== Temporary GUI preview screenshots =====
-gui-shot*.png
+# 订阅缓存 / 配置文件（含订阅密钥）
+data/sub.b64
+data/config.yaml
+data/core.conf
+data/core.log
+data/traffic.log
+data/cache.db
+data/nodes_cache.json
+data/app_rules.json
 
-# ===== Third-party prebuilt binaries =====
-core/singbox-core/
-
-# ===== Sensitive subscription credentials =====
-singbox-config.json
-sub
-
-# ===== WorkBuddy internal / analysis artifacts =====
-.workbuddy/
-dev-progress-report.html
-
-# ===== PyInstaller build outputs =====
-build/
-dist/
-
-# ===== WinUI 3 build outputs =====
-gui-winui/bin/
-gui-winui/obj/
-
-# ===== GUI runtime state / backups =====
-.gui-core
-cache.db
-*.bak-*
-web-shot*.png
-.gui-window
-.gui-theme
-.gui-crash.log
+# 运行时
+*.log

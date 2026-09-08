@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: MIT
+# AetherCore - Python 代码检查
+#
+# 每次推送到 main/master 或手动触发时，检查所有 Python 模块语法与导入。
+
+name: Check Python
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 语法检查
+        run: |
+          python -m py_compile core\aether_core.py
+          python -m py_compile core\aether_gen.py
+          python -m py_compile core\aether_rules.py
+          python -m py_compile core\aether_tray.py
+          python -m py_compile core\aether_tun.py
+          python -m py_compile launcher.py
+          Write-Host "语法检查通过"
+
+      - name: 导入检查
+        run: python -c "from core import aether_core, aether_gen, aether_rules, aether_tray, aether_tun; print('所有模块导入成功')"
