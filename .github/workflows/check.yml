@@ -27,10 +27,17 @@ jobs:
           python -m py_compile core\aether_core.py
           python -m py_compile core\aether_gen.py
           python -m py_compile core\aether_rules.py
-          python -m py_compile core\aether_tray.py
           python -m py_compile core\aether_tun.py
+          python -m py_compile core\aether_geoip.py
+          python -m py_compile core\tun_dns.py
+          python -m py_compile core\tun_tcp.py
+          python -m py_compile core\tun_stack.py
           python -m py_compile launcher.py
+          python -m py_compile test_tun.py
           Write-Host "语法检查通过"
 
       - name: 导入检查
-        run: python -c "from core import aether_core, aether_gen, aether_rules, aether_tray, aether_tun; print('所有模块导入成功')"
+        run: python -c "from core import aether_core, aether_gen, aether_rules, aether_tun, aether_geoip, tun_dns, tun_tcp, tun_stack; print('所有模块导入成功')"
+
+      - name: 运行单元测试
+        run: python test_tun.py

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 AetherCore - 全自动透明代理与单进程独占分流管理器
@@ -7,10 +7,20 @@ AetherCore - 全自动透明代理与单进程独占分流管理器
 
 import os
 import sys
+
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 import io
 import time
 import json
 import socket
+import struct
 import re
 import ctypes
 import signal
@@ -24,12 +34,51 @@ import winreg
 import msvcrt
 from ctypes import wintypes
 
+def get_process_for_port(port: int) -> str:
+    """Windows 获取指定本地 TCP 端口的进程名"""
+    if sys.platform != "win32" or port <= 0:
+        return "App"
+    try:
+        TCP_TABLE_OWNER_PID_ALL = 5
+        AF_INET = 2
+        size = wintypes.DWORD(0)
+        ctypes.windll.iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0)
+        buf = ctypes.create_string_buffer(size.value)
+        if ctypes.windll.iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != 0:
+            return "App"
+        num = struct.unpack_from("I", buf, 0)[0]
+        offset = 4
+        pid = 0
+        for _ in range(num):
+            state, laddr, lport, raddr, rport, owning_pid = struct.unpack_from("6I", buf, offset)
+            net_port = socket.ntohs(lport & 0xFFFF)
+            if net_port == port:
+                pid = owning_pid
+                break
+            offset += 24
+        if pid <= 0:
+            return "App"
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return "App"
+        try:
+            name_buf = ctypes.create_unicode_buffer(512)
+            name_size = wintypes.DWORD(512)
+            if ctypes.windll.kernel32.QueryFullProcessImageNameW(h, 0, name_buf, ctypes.byref(name_size)):
+                return os.path.basename(name_buf.value)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    except Exception:
+        pass
+    return "App"
+
 # 纯 Python 核心模块（替代 C 原生二进制）
 from core.aether_rules import rules_list as py_rules_list, rules_set as py_rules_set, \
     rules_del as py_rules_del, get_rules_path as py_rules_path
 from core.aether_gen import generate as py_gen_generate
 from core.aether_core import aether_core_main as py_core_main
-from core.aether_tray import AetherTray as PyAetherTray
 
 WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, WORKSPACE_DIR)
@@ -55,9 +104,73 @@ LOG_MAX_BYTES = 5 * 1024 * 1024
 AUTO_UPDATE_INTERVAL = 6 * 3600
 CONTROLLER = "http://127.0.0.1:9097"
 
+# ---- 订阅剩余流量缓存 ----
+_SUB_TRAFFIC = {
+    "upload": 0,      # 已用上行 (bytes)
+    "download": 0,    # 已用下行 (bytes)
+    "total": 0,       # 总流量 (bytes)
+    "expire": "",     # 到期时间字符串
+    "fetched_at": 0.0,  # 上次成功拉取时间戳
+}
+_SUB_TRAFFIC_LOCK = threading.Lock()
+_SUB_TRAFFIC_INTERVAL = 300  # 每 5 分钟刷新一次
+
+def _parse_sub_userinfo(header_val: str) -> dict:
+    """解析 subscription-userinfo 头，返回字段字典"""
+    result = {}
+    for part in header_val.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            result[k.strip()] = v.strip()
+    return result
+
+def _refresh_sub_traffic():
+    """后台拉取订阅头，更新剩余流量缓存"""
+    from core.aether_gen import SUB_URL
+    try:
+        req = urllib.request.Request(
+            SUB_URL,
+            headers={"User-Agent": "ClashMeta; AetherCore"},
+            method="HEAD",
+        )
+        res = urllib.request.urlopen(req, timeout=10)
+        info_hdr = res.headers.get("subscription-userinfo", "")
+        if not info_hdr:
+            # HEAD 不返回时改用 GET 但只读头
+            req2 = urllib.request.Request(SUB_URL, headers={"User-Agent": "ClashMeta; AetherCore"})
+            res2 = urllib.request.urlopen(req2, timeout=10)
+            info_hdr = res2.headers.get("subscription-userinfo", "")
+            res2.close()
+        if info_hdr:
+            parsed = _parse_sub_userinfo(info_hdr)
+            with _SUB_TRAFFIC_LOCK:
+                _SUB_TRAFFIC["upload"]   = int(parsed.get("upload", 0) or 0)
+                _SUB_TRAFFIC["download"] = int(parsed.get("download", 0) or 0)
+                _SUB_TRAFFIC["total"]    = int(parsed.get("total", 0) or 0)
+                _SUB_TRAFFIC["expire"]   = parsed.get("expire", "")
+                _SUB_TRAFFIC["fetched_at"] = time.time()
+    except Exception:
+        pass
+
+def _sub_traffic_loop(stopping):
+    """后台循环：启动立即拉一次，之后每 5 分钟刷新"""
+    _refresh_sub_traffic()
+    while not stopping.is_set():
+        stopping.wait(timeout=_SUB_TRAFFIC_INTERVAL)
+        if not stopping.is_set():
+            _refresh_sub_traffic()
+
 class Color:
     RESET   = "\033[0m"
     BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    ITALIC  = "\033[3m"
+    UNDERLINE = "\033[4m"
+    REVERSE = "\033[7m"
+
+    # 前景色
+    BLACK   = "\033[30m"
     RED     = "\033[91m"
     GREEN   = "\033[92m"
     YELLOW  = "\033[93m"
@@ -65,6 +178,15 @@ class Color:
     MAGENTA = "\033[95m"
     CYAN    = "\033[96m"
     WHITE   = "\033[97m"
+    GRAY    = "\033[90m"
+
+    # 背景与暗调强调色
+    BG_DARK    = "\033[48;5;236m"
+    BG_BLUE    = "\033[48;5;24m"
+    BG_CYAN    = "\033[48;5;30m"
+    BG_GREEN   = "\033[48;5;28m"
+    BG_MAGENTA = "\033[48;5;53m"
+    BG_GRAY    = "\033[48;5;238m"
 
 APP_RULES_FILE = os.path.join(DATA_DIR, "app_rules.json")
 
@@ -146,6 +268,81 @@ def kill_conflicting_proxies():
         except Exception:
             pass
 
+def get_pids_for_ports(*ports: int) -> set:
+    """获取正在使用指定本地 TCP 端口的所有进程 PID"""
+    if sys.platform != "win32":
+        return set()
+    pids = set()
+    try:
+        TCP_TABLE_OWNER_PID_ALL = 5
+        AF_INET = 2
+        size = wintypes.DWORD(0)
+        ctypes.windll.iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0)
+        buf = ctypes.create_string_buffer(size.value)
+        if ctypes.windll.iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == 0:
+            num = struct.unpack_from("I", buf, 0)[0]
+            offset = 4
+            for _ in range(num):
+                state, laddr, lport, raddr, rport, owning_pid = struct.unpack_from("6I", buf, offset)
+                net_port = socket.ntohs(lport & 0xFFFF)
+                if net_port in ports and owning_pid > 0:
+                    pids.add(owning_pid)
+                offset += 24
+    except Exception:
+        pass
+    return pids
+
+def _terminate_pid(pid: int) -> bool:
+    """强制结束指定 PID 进程"""
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        PROCESS_TERMINATE = 0x0001
+        SYNCHRONIZE = 0x00100000
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, False, pid)
+        if h:
+            ctypes.windll.kernel32.TerminateProcess(h, 0)
+            ctypes.windll.kernel32.WaitForSingleObject(h, 1000)
+            ctypes.windll.kernel32.CloseHandle(h)
+            return True
+    except Exception:
+        pass
+    return False
+
+def kill_old_instances() -> bool:
+    """自动查找并强制关闭所有运行中的旧实例及占用代理端口的旧进程"""
+    my_pid = os.getpid()
+    killed = False
+
+    # 1. 终止占用 7899 (代理) 或 9097 (控制器) 的所有其他进程
+    for port in (7899, 9097):
+        pids = get_pids_for_ports(port)
+        for pid in pids:
+            if pid != my_pid:
+                if _terminate_pid(pid):
+                    killed = True
+
+    # 2. 终止其他正在运行 launcher.py 或 aether_core 的 Python 实例
+    try:
+        ps_cmd = (
+            f"$curr = {my_pid}; "
+            "Get-CimInstance Win32_Process -Filter \"Name = 'python.exe'\" -ErrorAction SilentlyContinue | "
+            "Where-Object { "
+            f"$_.ProcessId -ne $curr -and ($_.CommandLine -like '*launcher.py*' -or $_.CommandLine -like '*aether_core*') "
+            "} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+        )
+        res = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd],
+                             capture_output=True, timeout=5)
+        if res.returncode == 0 and res.stdout:
+            killed = True
+    except Exception:
+        pass
+
+    if killed:
+        time.sleep(0.5)
+
+    return killed
+
 def core_already_running() -> bool:
     try:
         req = urllib.request.Request(CONTROLLER + "/version",
@@ -197,30 +394,82 @@ def open_logs_file():
     if os.path.exists(LOG_FILE):
         os.system(f'start "" "{LOG_FILE}"')
 
-class _InternetProxyInfo(ctypes.Structure):
-    _fields_ = [
-        ("dwAccessType", wintypes.DWORD),
-        ("lpszProxy", wintypes.LPCWSTR),
-        ("lpszProxyBypass", wintypes.LPCWSTR),
-    ]
-
-def set_system_proxy(enable: bool):
-    try:
-        wininet = ctypes.windll.wininet
-        wininet.InternetSetOptionW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD]
-        wininet.InternetSetOptionW.restype = wintypes.BOOL
-        if enable:
-            info = _InternetProxyInfo(3, "127.0.0.1:7899", "<local>")
-        else:
-            info = _InternetProxyInfo(1, None, None)
-        wininet.InternetSetOptionW(None, 38, ctypes.byref(info), ctypes.sizeof(info))
-        wininet.InternetSetOptionW(None, 39, None, 0)
-        wininet.InternetSetOptionW(None, 37, None, 0)
-    except Exception:
-        pass
+# AetherCore 专为 TUN 透明接管设计（始终以管理员权限运行，通过 WinTun 驱动直接在 L3 网络层接管全流量，无需且不修改 Windows 系统代理）
 
 _CORE_THREAD = None
 _CORE_STOP_EVENT = threading.Event()
+_MONITOR_THREADS = []
+
+# ---- TUN 全局接管 ----
+_TUN_MODE = {"active": False, "error": None}
+_TUN_ENGINE = None
+
+
+def parse_tun_enabled(conf_path: str) -> bool:
+    """解析 core.conf 中的 tun 开关 (缺省视为开启)"""
+    try:
+        with open(conf_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if parts and parts[0] == "tun" and len(parts) >= 2:
+                    return parts[1].strip().lower() in ("on", "1", "true", "yes")
+    except Exception:
+        pass
+    return True
+
+
+def parse_listen_addr(conf_path: str):
+    """解析 core.conf 的 listen 行，返回 (ip, port)"""
+    try:
+        with open(conf_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if parts and parts[0] == "listen" and len(parts) >= 3:
+                    return parts[1].strip(), int(parts[2].strip())
+    except Exception:
+        pass
+    return "127.0.0.1", 7899
+
+
+def wait_core_listen(host: str, port: int, timeout: float = 8.0) -> bool:
+    """等待内核 SOCKS5/HTTP 入站就绪 (TUN 桥接依赖它)"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.3)
+            s.connect((host, port))
+            s.close()
+            return True
+        except Exception:
+            time.sleep(0.2)
+    return False
+
+
+def start_tun_engine():
+    """启动 TUN 引擎 (需管理员权限)"""
+    global _TUN_ENGINE
+    from core.tun_stack import TunEngine
+    host, port = parse_listen_addr(CORE_CONF)
+
+    def tun_log(msg):
+        print(f"{Color.CYAN}{msg}{Color.RESET}", flush=True)
+
+    eng = TunEngine(socks_addr=(host, port), conf_path=CORE_CONF, log=tun_log)
+    eng.start()
+    _TUN_ENGINE = eng
+
+
+def stop_tun_engine():
+    global _TUN_ENGINE
+    if _TUN_ENGINE is not None:
+        try:
+            _TUN_ENGINE.stop()
+        except Exception:
+            pass
+        _TUN_ENGINE = None
+    _TUN_MODE["active"] = False
+
 
 def start_core():
     core_log_path = os.path.join(DATA_DIR, "core.log")
@@ -287,7 +536,10 @@ def ensure_single_instance(create=True) -> bool:
         kernel32.CreateMutexW.restype = wintypes.HANDLE
         kernel32.GetLastError.restype = wintypes.DWORD
         kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX)
-        return kernel32.GetLastError() != 183
+        if kernel32.GetLastError() == 183:
+            time.sleep(0.3)
+            kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX)
+        return True
     except Exception:
         return True
 
@@ -343,6 +595,8 @@ class _CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
                 ("dwMaximumWindowSize", _COORD)]
 
 def _is_wide(cp):
+    if 0x1F1E6 <= cp <= 0x1F1FF:
+        return False  # 国旗 Emoji 由两个区域指示符构成，每个占1格，合并共2格
     return (0x1100 <= cp <= 0x115F or 0x2E80 <= cp <= 0xA4CF or 0xAC00 <= cp <= 0xD7A3
             or 0xF900 <= cp <= 0xFAFF or 0xFE30 <= cp <= 0xFE4F or 0xFF00 <= cp <= 0xFF60
             or 0xFFE0 <= cp <= 0xFFE6 or 0x1F000 <= cp <= 0x1FAFF or 0x20000 <= cp <= 0x3FFFD
@@ -363,25 +617,138 @@ def _truncate(text, width):
         used += cw
     return "".join(out)
 
+def _pad_disp(text: str, target_width: int, align: str = "left", fill: str = " ") -> str:
+    """按终端显示宽度填充字符串，精准支持双宽中文字符与 Emoji"""
+    text = str(text or "")
+    cur_w = _disp_width(text)
+    if cur_w > target_width:
+        text = _truncate(text, target_width)
+        cur_w = _disp_width(text)
+    diff = max(target_width - cur_w, 0)
+    if align == "right":
+        return (fill * diff) + text
+    elif align == "center":
+        l_pad = diff // 2
+        return (fill * l_pad) + text + (fill * (diff - l_pad))
+    else:
+        return text + (fill * diff)
+
+def disable_quick_edit():
+    """禁用 Windows 控制台快速编辑模式，防止鼠标点击终端窗口时触发选择暂停导致程序卡死"""
+    if sys.platform != "win32":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        GENERIC_READ = 0x80000000
+        GENERIC_WRITE = 0x40000000
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        OPEN_EXISTING = 3
+        h_conin = kernel32.CreateFileW(
+            "CONIN$",
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            0,
+            None,
+        )
+        if h_conin and h_conin != -1:
+            mode = wintypes.DWORD()
+            if kernel32.GetConsoleMode(h_conin, ctypes.byref(mode)):
+                ENABLE_QUICK_EDIT_MODE = 0x0040
+                ENABLE_EXTENDED_FLAGS = 0x0080
+                new_mode = (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS
+                kernel32.SetConsoleMode(h_conin, new_mode)
+            kernel32.CloseHandle(h_conin)
+    except Exception:
+        pass
+
 class Tui:
     def __init__(self):
+        disable_quick_edit()
         self.hOut = ctypes.windll.kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
         self.csbi = _CONSOLE_SCREEN_BUFFER_INFO()
         if not ctypes.windll.kernel32.GetConsoleScreenBufferInfo(
                 self.hOut, ctypes.byref(self.csbi)):
-            raise OSError("no console")
+            # 尝试通过 CONOUT$ 获取真实的控制台缓冲区句柄 (解决 PowerShell/Windows Terminal 下句柄重定向问题)
+            GENERIC_READ = 0x80000000
+            GENERIC_WRITE = 0x40000000
+            FILE_SHARE_READ = 0x00000001
+            FILE_SHARE_WRITE = 0x00000002
+            OPEN_EXISTING = 3
+            self.hOut = ctypes.windll.kernel32.CreateFileW(
+                "CONOUT$",
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                0,
+                None
+            )
+            if not self.hOut or self.hOut == -1:
+                self.hOut = None
+
+        # 尝试开启 Windows 终端 ANSI 虚拟终端序列支持 (VT Processing)
+        if self.hOut and self.hOut != -1:
+            try:
+                mode = ctypes.c_ulong()
+                if ctypes.windll.kernel32.GetConsoleMode(self.hOut, ctypes.byref(mode)):
+                    ctypes.windll.kernel32.SetConsoleMode(self.hOut, mode.value | 0x0004)
+            except Exception:
+                pass
+
         self._prev = None
         self._started = False
+        self._prev_size = (0, 0)
+        self._hwnd = None
+        self._was_focused = True  # 假设启动时有焦点
+        self._original_buffer_size = None
+        try:
+            self._hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        except Exception:
+            self._hwnd = None
+
+    def _is_focused(self):
+        """检测控制台窗口是否是当前前台窗口"""
+        try:
+            if self._hwnd:
+                fg = ctypes.windll.user32.GetForegroundWindow()
+                return fg == self._hwnd
+        except Exception:
+            pass
+        return True  # 无法判断时默认有焦点
 
     def size(self):
-        ctypes.windll.kernel32.GetConsoleScreenBufferInfo(self.hOut, ctypes.byref(self.csbi))
-        w = self.csbi.srWindow.Right - self.csbi.srWindow.Left + 1
-        h = self.csbi.srWindow.Bottom - self.csbi.srWindow.Top + 1
-        return max(w, 1), max(h, 1)
+        if self.hOut and self.hOut != -1:
+            try:
+                if ctypes.windll.kernel32.GetConsoleScreenBufferInfo(self.hOut, ctypes.byref(self.csbi)):
+                    w = self.csbi.srWindow.Right - self.csbi.srWindow.Left + 1
+                    h = self.csbi.srWindow.Bottom - self.csbi.srWindow.Top + 1
+                    if w > 10 and h > 5:
+                        return max(w, 1), max(h, 1)
+            except Exception:
+                pass
+        import shutil
+        ts = shutil.get_terminal_size((100, 30))
+        return max(ts.columns, 20), max(ts.lines, 10)
 
     def start(self):
+        disable_quick_edit()
         if not self._started:
-            sys.stdout.write("\033[2J\033[H\033[?25l")
+            if self.hOut and self.hOut != -1:
+                try:
+                    if ctypes.windll.kernel32.GetConsoleScreenBufferInfo(
+                            self.hOut, ctypes.byref(self.csbi)):
+                        self._original_buffer_size = _COORD(
+                            self.csbi.dwSize.X, self.csbi.dwSize.Y)
+                        height = self.csbi.srWindow.Bottom - self.csbi.srWindow.Top + 1
+                        size = _COORD(self.csbi.dwSize.X, height)
+                        ctypes.windll.kernel32.SetConsoleScreenBufferSize(
+                            self.hOut, size)
+                except Exception:
+                    self._original_buffer_size = None
+            sys.stdout.write("\033[2J\033[3J\033[H\033[?25l")
             sys.stdout.flush()
             self._started = True
 
@@ -389,7 +756,18 @@ class Tui:
         if self._started:
             sys.stdout.write("\033[?25h\033[0m\033[H")
             sys.stdout.flush()
+            if self.hOut and self._original_buffer_size is not None:
+                try:
+                    ctypes.windll.kernel32.SetConsoleScreenBufferSize(
+                        self.hOut, self._original_buffer_size)
+                except Exception:
+                    pass
+            self._original_buffer_size = None
             self._started = False
+
+    def invalidate(self):
+        """强制下一帧全量重绘（清掉 diff 缓存）"""
+        self._prev = None
 
     @staticmethod
     def _compose(segments, width):
@@ -402,266 +780,50 @@ class Tui:
                 continue
             out.append(prefix or "")
             out.append(keep)
+            if prefix:
+                out.append("\033[0m")
             sig.append(keep)
             used += _disp_width(keep)
         line = "".join(out)
         pad = max(width - used, 0)
-        return "".join(sig), line + "\033[0m" + (" " * pad)
+        return "".join(sig), line + (" " * pad) + "\033[0m"
 
     def render(self, segment_rows):
+        if not segment_rows:
+            return
         w, h = self.size()
         self.start()
+
+        # 尺寸变化 → 强制全量重绘
+        cur_size = (w, h)
+        if cur_size != self._prev_size:
+            self._prev = None
+            self._prev_size = cur_size
+            # 清屏确保旧内容不残留
+            sys.stdout.write("\033[2J\033[3J\033[H")
+
+        # 焦点恢复 → 强制全量重绘（终端失焦后内容可能被其他窗口覆盖）
+        focused = self._is_focused()
+        if focused and not self._was_focused:
+            self._prev = None
+        self._was_focused = focused
+
         nxt = []
+        eff_w = max(w - 1, 20)
         for i in range(h):
             segs = segment_rows[i] if i < len(segment_rows) else []
-            _sig, line = self._compose(segs, w)
+            _sig, line = self._compose(segs, eff_w)
             prev = self._prev[i] if self._prev is not None and i < len(self._prev) else None
             if prev == line:
                 nxt.append(line)
                 continue
             if line:
-                sys.stdout.write(f"\033[{i + 1};1H{line}\033[K")
+                sys.stdout.write(f"\033[{i + 1};1H\033[2K{line}")
             else:
-                sys.stdout.write(f"\033[{i + 1};1H\033[K")
+                sys.stdout.write(f"\033[{i + 1};1H\033[2K")
             nxt.append(line)
         self._prev = nxt
         sys.stdout.flush()
-
-# ---- TrayBridge ----
-TRAY_CONNECT_TIMEOUT = 8.0
-
-def _enc(s):
-    return urllib.parse.quote(str(s), safe="")
-
-def _dec(s):
-    return urllib.parse.unquote(str(s))
-
-class TrayBridge:
-    def __init__(self, title="AetherCore 代理网关", on_exit_callback=None,
-                 on_reload_callback=None, on_autostart_callback=None,
-                 on_list_nodes_callback=None, on_node_select_callback=None,
-                 on_list_app_rules_callback=None, on_app_toggle_callback=None,
-                 on_open_app_rules_callback=None, on_reload_app_rules_callback=None,
-                 on_console_callback=None, console_visible_fn=None,
-                 on_open_logs_callback=None, autostart_enabled_fn=None,
-                 autostart_enabled=False, start_hidden=True):
-        self.title = title
-        self.on_exit_callback = on_exit_callback
-        self.on_reload_callback = on_reload_callback
-        self.on_autostart_callback = on_autostart_callback
-        self.on_list_nodes_callback = on_list_nodes_callback
-        self.on_node_select_callback = on_node_select_callback
-        self.on_list_app_rules_callback = on_list_app_rules_callback
-        self.on_app_toggle_callback = on_app_toggle_callback
-        self.on_open_app_rules_callback = on_open_app_rules_callback
-        self.on_reload_app_rules_callback = on_reload_app_rules_callback
-        self.on_console_callback = on_console_callback
-        self.console_visible_fn = console_visible_fn
-        self.on_open_logs_callback = on_open_logs_callback
-        self.autostart_enabled_fn = autostart_enabled_fn
-        self.autostart_enabled = autostart_enabled
-        self.start_hidden = start_hidden
-        self._srv = None
-        self._port = 0
-        self._proc = None
-        self._conn = None
-        self._stop = False
-        self._tray_ready = False
-        self._conn_lock = threading.Lock()
-        self._pending = []
-        self._pending_lock = threading.Lock()
-
-    def start(self):
-        try:
-            self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._srv.bind(("127.0.0.1", 0))
-            self._srv.listen(4)
-            self._srv.settimeout(0.5)
-            self._port = self._srv.getsockname()[1]
-        except Exception:
-            return False
-        threading.Thread(target=self._accept_loop, daemon=True, name="tray-srv").start()
-        try:
-            self._py_tray = PyAetherTray(self._port)
-            self._tray_thread = threading.Thread(target=self._py_tray.run, daemon=True, name="py-tray")
-            self._tray_thread.start()
-        except Exception:
-            return False
-        deadline = time.time() + TRAY_CONNECT_TIMEOUT
-        while time.time() < deadline:
-            with self._conn_lock:
-                if self._tray_ready:
-                    return True
-            time.sleep(0.2)
-        self.stop()
-        return False
-
-    def stop(self):
-        self._stop = True
-        conn = self._conn
-        if conn is not None:
-            try:
-                with self._conn_lock:
-                    conn.sendall(b"QUIT\n")
-            except Exception:
-                pass
-        if hasattr(self, '_py_tray') and self._py_tray is not None:
-            try:
-                self._py_tray.stop()
-            except Exception:
-                pass
-        if self._srv is not None:
-            try:
-                self._srv.close()
-            except Exception:
-                pass
-
-    def show_notification(self, title, msg):
-        payload = f"NOTIFY {_enc(title)}|{_enc(msg)}\n".encode("utf-8")
-        with self._conn_lock:
-            conn = self._conn
-            if conn is not None and self._tray_ready:
-                try:
-                    conn.sendall(payload)
-                    return
-                except Exception:
-                    pass
-        with self._pending_lock:
-            self._pending.append((str(title), str(msg)))
-            if len(self._pending) > 8:
-                self._pending.pop(0)
-
-    def _accept_loop(self):
-        while not self._stop:
-            try:
-                conn, _ = self._srv.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            threading.Thread(target=self._handle, args=(conn,), daemon=True, name="tray-conn").start()
-
-    def _handle(self, conn):
-        buf = b""
-        conn.settimeout(1.0)
-        with self._conn_lock:
-            self._conn = conn
-        with self._pending_lock:
-            pending = list(self._pending)
-            self._pending.clear()
-        for title, msg in pending:
-            try:
-                conn.sendall(f"NOTIFY {_enc(title)}|{_enc(msg)}\n".encode("utf-8"))
-            except Exception:
-                break
-        try:
-            while not self._stop:
-                try:
-                    chunk = conn.recv(4096)
-                except socket.timeout:
-                    continue
-                except OSError:
-                    break
-                if not chunk:
-                    break
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    line = line.decode("utf-8", errors="replace").strip()
-                    if line:
-                        self._dispatch(conn, line)
-        finally:
-            with self._conn_lock:
-                if self._conn is conn:
-                    self._conn = None
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    @staticmethod
-    def _reply(conn, rid, ok, payload=""):
-        status = "OK" if ok else "ERR"
-        line = f"{rid} {status} {payload}\n" if payload else f"{rid} {status}\n"
-        try:
-            conn.sendall(line.encode("utf-8"))
-        except Exception:
-            pass
-
-    def _dispatch(self, conn, line):
-        parts = line.split(" ", 2)
-        if len(parts) < 2:
-            return
-        rid, cmd = parts[0], parts[1].upper()
-        arg = _dec(parts[2].strip()) if len(parts) > 2 else ""
-        try:
-            if cmd == "PING":
-                with self._conn_lock:
-                    self._tray_ready = True
-                self._reply(conn, rid, True, "PONG")
-            elif cmd == "STATUS":
-                vis = 1 if (self.console_visible_fn and self.console_visible_fn()) else 0
-                auto = 1 if (self.autostart_enabled_fn and self.autostart_enabled_fn()) else 0
-                self._reply(conn, rid, True, f"autostart={auto} console={vis}")
-            elif cmd == "NODES":
-                items = self.on_list_nodes_callback() or []
-                parts = [f"{_enc(n)}={1 if sel else 0}" for n, sel in items]
-                self._reply(conn, rid, True, f"{len(parts)};" + ";".join(parts))
-            elif cmd == "APPS":
-                items = self.on_list_app_rules_callback() or []
-                parts = [f"{_enc(p)}={_enc(t)}={_enc(l)}" for p, t, l in items]
-                self._reply(conn, rid, True, f"{len(parts)};" + ";".join(parts))
-            elif cmd == "SELECT":
-                if self.on_node_select_callback:
-                    self.on_node_select_callback(arg)
-                self._reply(conn, rid, True)
-            elif cmd == "APPSET":
-                if self.on_app_toggle_callback:
-                    self.on_app_toggle_callback(arg)
-                self._reply(conn, rid, True)
-            elif cmd == "APPRELOAD":
-                if self.on_reload_app_rules_callback:
-                    self.on_reload_app_rules_callback()
-                self._reply(conn, rid, True)
-            elif cmd == "CONSOLE":
-                vis = 1
-                if self.on_console_callback:
-                    vis = 1 if self.on_console_callback() else 0
-                self._reply(conn, rid, True, f"console={vis}")
-            elif cmd == "LOG":
-                if self.on_open_logs_callback:
-                    self.on_open_logs_callback()
-                self._reply(conn, rid, True)
-            elif cmd == "OPENAPPS":
-                if self.on_open_app_rules_callback:
-                    self.on_open_app_rules_callback()
-                self._reply(conn, rid, True)
-            elif cmd == "AUTOSTART":
-                if self.on_autostart_callback:
-                    self.on_autostart_callback()
-                auto = 1 if (self.autostart_enabled_fn and self.autostart_enabled_fn()) else 0
-                self._reply(conn, rid, True, f"enabled={auto}")
-            elif cmd == "UPDATE":
-                if self.on_reload_callback:
-                    self.on_reload_callback()
-                self._reply(conn, rid, True)
-            elif cmd == "EXIT":
-                self._reply(conn, rid, True)
-                if self.on_exit_callback:
-                    threading.Thread(target=self._run_exit, daemon=True, name="tray-exit").start()
-            else:
-                self._reply(conn, rid, False, "unknown command")
-        except Exception as e:
-            self._reply(conn, rid, False, str(e))
-
-    def _run_exit(self):
-        try:
-            if self.on_exit_callback:
-                self.on_exit_callback()
-        except Exception:
-            pass
-
 
 # ---- 内核控制器通信 ----
 def _controller_request(method, path, payload=None, timeout=4):
@@ -703,29 +865,93 @@ def _refresh_nodes_async():
     threading.Thread(target=work, daemon=True, name="node-refresh").start()
 
 def list_manual_nodes():
-    if time.time() - _NODE_CACHE["t"] < _NODE_TTL:
-        return _NODE_CACHE["items"]
-    _refresh_nodes_async()
+    if not _NODE_CACHE["items"] or (time.time() - _NODE_CACHE["t"] >= _NODE_TTL):
+        ok, _, text = _controller_request("GET", "/proxies", timeout=1.5)
+        if ok and text:
+            try:
+                data = json.loads(text)
+                proxies = data.get("proxies", {})
+                group = None
+                for k, v in proxies.items():
+                    if "MANUAL" in k or "手动" in k:
+                        group = v
+                        break
+                if not group and proxies:
+                    group = next(iter(proxies.values()))
+                if group:
+                    now = group.get("now", "")
+                    items = [(n, n == now) for n in group.get("all", [])]
+                    if items:
+                        _NODE_CACHE["items"] = items
+                        _NODE_CACHE["t"] = time.time()
+                        return items
+            except Exception:
+                pass
+        _refresh_nodes_async()
     return _NODE_CACHE["items"]
 
 def select_manual_node(name: str) -> bool:
     payload = json.dumps({"name": name}).encode("utf-8")
-    ok, _, _ = _controller_request("PUT", "/proxies/" + urllib.parse.quote(MANUAL_GROUP), payload)
-    return ok
+    for grp in ("🎮 手动节点 (MANUAL)", MANUAL_GROUP):
+        ok, status, _ = _controller_request("PUT", "/proxies/" + urllib.parse.quote(grp), payload)
+        if ok and (status in (200, 204)):
+            return True
+    return False
 
-# ---- 分应用代理 ----
+# ---- 分应用代理与配置热重载 ----
 def apply_app_rules_async():
     def worker():
         try:
             push_status("[i] 正在应用分应用代理规则...")
             ok, _ = run_gen(fetch=False, echo=False)
-            if ok and restart_core():
-                push_status("[ok] 分应用代理规则已生效")
+            if ok:
+                # 优先使用控制器热重载 PUT /configs
+                payload = json.dumps({"path": CORE_CONF}).encode("utf-8")
+                hot_ok, status, _ = _controller_request("PUT", "/configs", payload, timeout=5)
+                if hot_ok and status in (200, 204):
+                    push_status("[ok] 分应用代理规则已热重载生效")
+                    return
+                # 回退到完整重启内核
+                if restart_core():
+                    push_status("[ok] 分应用代理规则已生效（重启内核）")
+                else:
+                    push_status("[x] 分应用规则应用失败（内核未就绪?）")
             else:
-                push_status("[x] 分应用规则应用失败（内核未就绪?）")
+                push_status("[x] 分应用规则配置生成失败")
         except Exception as e:
             push_status(f"[x] 分应用规则应用异常: {e}")
     threading.Thread(target=worker, daemon=True, name="app-rules").start()
+
+def update_subscription_async(trigger_name="自动更新"):
+    """异步拉取最新订阅，生成配置并通过控制器热重载 (PUT /configs)"""
+    def worker():
+        try:
+            push_status(f"[i] 正在{trigger_name}拉取订阅...")
+            ok, _ = run_gen(fetch=True, echo=False)
+            if ok:
+                payload = json.dumps({"path": CORE_CONF}).encode("utf-8")
+                hot_ok, status, _ = _controller_request("PUT", "/configs", payload, timeout=5)
+                if hot_ok and status in (200, 204):
+                    push_status(f"[ok] 订阅已更新并热重载生效 ({trigger_name})")
+                    _refresh_nodes_async()
+                    _refresh_sub_traffic()
+                else:
+                    if restart_core():
+                        push_status(f"[ok] 订阅已更新，内核已重载 ({trigger_name})")
+                    else:
+                        push_status(f"[x] 订阅更新完成但重载内核失败")
+            else:
+                push_status(f"[!] 订阅拉取失败，保留当前配置 ({trigger_name})")
+        except Exception as e:
+            push_status(f"[x] 订阅更新异常: {e}")
+    threading.Thread(target=worker, daemon=True, name="sub-updater").start()
+
+def _auto_update_loop(stopping):
+    """后台循环：每 6 小时自动拉取订阅并热重载配置"""
+    while not stopping.is_set():
+        stopping.wait(timeout=AUTO_UPDATE_INTERVAL)
+        if not stopping.is_set():
+            update_subscription_async("定时任务")
 
 def set_app_target(proc, target):
     rules_set(proc, target)
@@ -735,35 +961,23 @@ def remove_app_target(proc):
     rules_del(proc)
     apply_app_rules_async()
 
-def _build_app_panel_frame(seen_procs, panel_idx, width, height, last_status):
-    rules = rules_list()
-    procs = sorted(set(rules) | set(seen_procs),
-                   key=lambda p: (-seen_procs.get(p, 0), p))
-    max_data = max(height - 4, 0)
-    colors = Color()
-    rows = [[(f" 分应用代理 | {time.strftime('%H:%M:%S')} | 共 {len(procs)} 个进程", f"{colors.CYAN}{colors.BOLD}")]]
-    rows.append([("进程名                           目标                    最近连接", f"{colors.WHITE}{colors.BOLD}")])
-    for i, p in enumerate(procs[:max_data]):
-        mark = ">" if i == panel_idx else " "
-        label = target_label(rules.get(p, "")) if p in rules else "未设置(跟随全局)"
-        rows.append([
-            (f"{mark} {p}", f"{colors.GREEN}" if i == panel_idx else ""),
-            (" ", ""),
-            (label, f"{colors.YELLOW}" if p in rules else ""),
-            (" ", ""),
-            (f"x{seen_procs.get(p, 0)}", ""),
-        ])
-    rows.append([(last_status or "选择进程后按 1/2/3 设置，x 删除规则", f"{colors.YELLOW}")])
-    rows.append([("j/k 选择  1 本地直连  2 走代理(手动节点)  3 自动优选  x 删除  p/q 返回", "")])
-    return rows
-
-def format_bytes(b: int) -> str:
-    if b < 1024:
-        return f"{b} B"
-    elif b < 1024 * 1024:
-        return f"{b / 1024:.1f} KB"
+def format_bytes(b) -> str:
+    try:
+        val = float(b or 0)
+    except Exception:
+        return "0 B"
+    if val < 1:
+        return "0 B"
+    elif val < 1024:
+        return f"{val:.0f} B"
+    elif val < 1024 * 1024:
+        return f"{val / 1024:.1f} KB"
+    elif val < 1024 ** 3:
+        return f"{val / (1024 * 1024):.2f} MB"
+    elif val < 1024 ** 4:
+        return f"{val / (1024 ** 3):.2f} GB"
     else:
-        return f"{b / (1024 * 1024):.2f} MB"
+        return f"{val / (1024 ** 4):.2f} TB"
 
 # ---- 状态消息队列 ----
 console_status_queue = queue.Queue()
@@ -789,15 +1003,31 @@ class ConnectionTable:
             r["node_prefix"] = entry["node_prefix"]
             r["target"] = entry["target"]
             r["proto"] = entry["proto"]
+            if "status" in entry:
+                r["status"] = entry["status"]
             return False
         e = dict(entry)
         e["count"] = 1
+        e["status"] = entry.get("status", "ACTIVE")
         self.rows[key] = e
         if len(self.rows) > self.max_rows:
             self.rows.popitem(last=False)
         return True
 
+    def update_status(self, target, status, node_override=None):
+        target_clean = target.split(":")[0].strip().lower()
+        matched = False
+        for k, r in self.rows.items():
+            r_target = r["target"].split(":")[0].strip().lower()
+            if r_target == target_clean or r["target"] == target:
+                r["status"] = status
+                if node_override:
+                    r["node_plain"] = node_override
+                matched = True
+        return matched
+
 TRAFFIC = {"up": 0, "down": 0}
+RECENT_LOGS = collections.deque(maxlen=300)
 
 def _traffic_stream():
     while not _CORE_STOP_EVENT.is_set():
@@ -836,59 +1066,877 @@ def _traffic_stream():
             except Exception:
                 pass
 
-def _build_frame(table, last_status, width, height, up, down, up_spd, down_spd,
-                 proto_filter=None, sort_mode="time", keys_hint=""):
+def _log_stream(table, seen_procs, log_fp, stopping, tui_active_fn):
+    re_conn = re.compile(
+        r'\[(?P<proto>[A-Za-z0-9_-]+)\]\s+(?P<src>[^\s]+)\s+-->\s+(?P<target>[^\s]+)\s+(?:match\s+(?P<rule>[^\s]+)\s+)?using\s+(?P<node>.+)'
+    )
+    re_proc_paren = re.compile(r'\(([^)]+)\)')
+    re_closed = re.compile(r'\[CLOSED\]\s+(?:\((?P<proc>[^)]+)\)\s+)?(?P<target>[^\s]+)')
+    re_timeout = re.compile(r'\[TIMEOUT\]\s+(?:\((?P<proc>[^)]+)\)\s+)?(?P<target>[^\s]+)')
+    re_fallback = re.compile(r'\[FALLBACK\]\s+(?:\((?P<proc>[^)]+)\)\s+)?(?P<target>[^\s]+)')
+    re_fail = re.compile(r'\[FAIL\]\s+(?:\((?P<proc>[^)]+)\)\s+)?(?P<target>[^\s]+)')
+    re_success = re.compile(r'\[SUCCESS\]\s+(?:\((?P<proc>[^)]+)\)\s+)?(?P<target>[^\s]+)')
+
+    while not stopping.is_set() and not _CORE_STOP_EVENT.is_set():
+        s = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3.0)
+            s.connect(('127.0.0.1', 9097))
+            req = 'GET /logs HTTP/1.1\r\nHost: 127.0.0.1:9097\r\nAuthorization: Bearer aethercore\r\nConnection: keep-alive\r\n\r\n'
+            s.sendall(req.encode('ascii'))
+            buffer = ""
+            while not stopping.is_set() and not _CORE_STOP_EVENT.is_set():
+                try:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buffer += chunk.decode('utf-8', errors='replace')
+                    while '\n' in buffer:
+                        ln, buffer = buffer.split('\n', 1)
+                        ln = ln.strip()
+                        if not ln or not ln.startswith('{'):
+                            continue
+                        try:
+                            d = json.loads(ln)
+                        except Exception:
+                            continue
+                        payload = d.get("payload", "").strip()
+                        if not payload:
+                            continue
+
+                        now_str = time.strftime("%H:%M:%S")
+                        RECENT_LOGS.append((now_str, payload))
+
+                        # 写入 traffic.log 文件
+                        try:
+                            if log_fp:
+                                log_fp.write(f"[{now_str}] {payload}\n")
+                                log_fp.flush()
+                        except Exception:
+                            pass
+
+                        # 捕获异常断开 / 超时 / 降级直连 / 成功状态
+                        m_closed = re_closed.search(payload)
+                        if m_closed:
+                            t_target = m_closed.group("target")
+                            t_proc = m_closed.group("proc") or "App"
+                            table.update_status(t_target, "CLOSED")
+                            push_status(f"⚠️ [{t_proc}] {t_target} 网页访问被远端服务器掐断(ERR_CONNECTION_CLOSED)，已自动切换直连自愈！")
+
+                        m_timeout = re_timeout.search(payload)
+                        if m_timeout:
+                            t_target = m_timeout.group("target")
+                            t_proc = m_timeout.group("proc") or "App"
+                            table.update_status(t_target, "TIMEOUT")
+                            push_status(f"⏱️ [{t_proc}] {t_target} 响应超时(ERR_TIMED_OUT)，已自动切换直连自愈！")
+
+                        m_fallback = re_fallback.search(payload)
+                        if m_fallback:
+                            t_target = m_fallback.group("target")
+                            t_proc = m_fallback.group("proc") or "App"
+                            table.update_status(t_target, "FALLBACK", "⚡ 自动直连 (自愈)")
+                            push_status(f"⚡ [{t_proc}] {t_target} 已切换为直连白名单，重试即可正常打开！")
+
+                        m_fail = re_fail.search(payload)
+                        if m_fail:
+                            t_target = m_fail.group("target")
+                            table.update_status(t_target, "FAIL")
+
+                        m_succ = re_success.search(payload)
+                        if m_succ:
+                            t_target = m_succ.group("target")
+                            table.update_status(t_target, "OK")
+
+                        # 尝试匹配连接日志并存入 ConnectionTable
+                        m = re_conn.search(payload)
+                        if m:
+                            proto = m.group("proto").upper()
+                            src = m.group("src")
+                            target = m.group("target")
+                            node_raw = m.group("node").strip().strip("'\"")
+
+                            proc = "App"
+                            m_proc = re_proc_paren.search(src)
+                            if m_proc:
+                                proc = m_proc.group(1)
+                            elif ":" in src:
+                                try:
+                                    sport = int(src.rsplit(":", 1)[1])
+                                    proc = get_process_for_port(sport) or "App"
+                                except Exception:
+                                    proc = "App"
+
+                            node_prefix = Color.YELLOW if "DIRECT" in node_raw.upper() else Color.CYAN
+                            entry = {
+                                "time": now_str,
+                                "proc": proc,
+                                "node_plain": node_raw,
+                                "node_prefix": node_prefix,
+                                "target": target,
+                                "proto": proto,
+                                "status": "ACTIVE",
+                            }
+                            key = (proc, target, proto)
+                            table.upsert(key, entry)
+                            seen_procs[proc] = seen_procs.get(proc, 0) + 1
+
+                            if not tui_active_fn():
+                                node_color = Color.YELLOW if "DIRECT" in node_raw.upper() else Color.CYAN
+                                print(f"{Color.WHITE}[{now_str}]{Color.RESET} "
+                                      f"{Color.MAGENTA}[{proto}]{Color.RESET} "
+                                      f"{Color.GREEN}[{proc}]{Color.RESET} ➔ "
+                                      f"{node_color}[{node_raw}]{Color.RESET} ➔ "
+                                      f"🎯 {Color.WHITE}{target}{Color.RESET}")
+                        else:
+                            if not (m_closed or m_fallback or m_fail or m_succ):
+                                push_status(payload)
+                            if not tui_active_fn():
+                                if "[x]" in payload or "error" in payload.lower() or "[closed]" in payload.lower():
+                                    c = Color.RED
+                                elif "[i]" in payload:
+                                    c = Color.CYAN
+                                elif "[fallback]" in payload.lower():
+                                    c = Color.YELLOW
+                                else:
+                                    c = Color.WHITE
+                                print(f"{Color.WHITE}[{now_str}]{Color.RESET} {c}{payload}{Color.RESET}")
+                except socket.timeout:
+                    continue
+        except Exception:
+            if stopping.is_set() or _CORE_STOP_EVENT.is_set():
+                break
+            time.sleep(1.0)
+        finally:
+            if s:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+def _make_col_divider(start: str, sep: str, end: str, col_widths: list, total_width: int) -> str:
+    """生成精确等宽的表格行分隔线"""
+    parts = []
+    for i, cw in enumerate(col_widths):
+        if i == 0:
+            parts.append(start + ("─" * cw))
+        else:
+            parts.append(sep + ("─" * cw))
+    parts.append(end)
+    res = "".join(parts)
+    diff = total_width - _disp_width(res)
+    if diff > 0:
+        res = res[:-len(end)] + ("─" * diff) + end
+    elif diff < 0:
+        res = res[:total_width - len(end)] + end
+    return res
+
+
+def _build_header_card(width: int, height: int, active_tab: int, up: int, down: int,
+                       up_spd: float, down_spd: float, extra_badge: str = "") -> list:
+    """构建统一的顶栏监控仪表盘与选项卡"""
     colors = Color()
     rows = []
-    title = (f"AetherCore Python 内核 | {time.strftime('%H:%M:%S')} | 默认全量代理"
-             f" | up {format_bytes(up)}  down {format_bytes(down)}")
-    rows.append([(title, f"{colors.CYAN}{colors.BOLD}")])
-    colh = "时间    进程            节点                       目标                           协议    次数"
-    rows.append([(colh, f"{colors.WHITE}{colors.BOLD}")])
-    if sort_mode == "count":
-        items = sorted(table.rows.items(), key=lambda kv: -kv[1]["count"])
+
+    # 1. 顶边框 + 运行状态胶囊 + 时间戳
+    t_now = time.strftime("%H:%M:%S")
+    b_left = "╭─[ "
+    title_parts = [
+        ("[运行正常]", colors.GREEN + colors.BOLD),
+        (" ]──[ ", colors.GRAY),
+        ("AetherCore 代理网关", colors.CYAN + colors.BOLD),
+        (" ]", colors.GRAY),
+    ]
+    if width < 85:
+        b_right = f"──[ {t_now} ]─╮"
     else:
-        items = reversed(list(table.rows.items()))
-    max_data = max(height - 4, 0)
-    added = 0
-    for key, r in items:
-        if added >= max_data:
-            break
-        if proto_filter is not None and r["proto"].upper() != proto_filter:
-            continue
-        rows.append([
-            (f"{r['time']}", ""),
-            ("  ", ""),
-            (f"[{r['proc']}]", f"{colors.GREEN}"),
-            (" ", ""),
-            (r["node_plain"], r["node_prefix"]),
-            (" ", ""),
-            (r["target"], f"{colors.WHITE}"),
-            ("  ", ""),
-            (f"({r['proto']})", f"{colors.MAGENTA}"),
-            (" ", ""),
-            (f"x{r['count']}", f"{colors.GREEN}{colors.BOLD}"),
+        b_right = f"──[ 127.0.0.1:7899 ]──[ {t_now} ]─╮"
+    w_title = sum(_disp_width(p[0]) for p in title_parts)
+    rem = max(width - _disp_width(b_left) - _disp_width(b_right) - w_title, 0)
+
+    row1 = [(b_left, colors.GRAY)] + title_parts + [("─" * rem, colors.GRAY), (b_right, colors.GRAY)]
+    rows.append(row1)
+
+    # 2. 统计速率栏 (出口节点、实时上行/下行速率与总量)
+    node_name = "默认节点"
+    node_count = 0
+    try:
+        import core.aether_core as ac
+        if ac.g_cfg and ac.g_cfg.nodes:
+            node_name = ac.g_cfg.nodes[ac.g_cfg.current_node].name
+            node_count = ac.g_cfg.node_count
+    except Exception:
+        pass
+
+    node_disp = _truncate(node_name, 14 if width < 90 else 22)
+    s_node = f" 节点: {node_disp} " if width < 90 else f" 节点: {node_disp} ({node_count}个) "
+    s_up = f" 上行: {format_bytes(up_spd)}/s " if width < 90 else f" 上行: {format_bytes(up_spd)}/s ({format_bytes(up)}) "
+    s_down = f" 下行: {format_bytes(down_spd)}/s " if width < 90 else f" 下行: {format_bytes(down_spd)}/s ({format_bytes(down)}) "
+    s_mode = " 模式: 全量代理 "
+
+    div = "│"
+    w_content = _disp_width(s_node) + 1 + _disp_width(s_up) + 1 + _disp_width(s_down)
+    if w_content + 1 + _disp_width(s_mode) <= width - 2:
+        w_content += 1 + _disp_width(s_mode)
+        include_mode = True
+    else:
+        include_mode = False
+
+    rem_spaces = max(width - 2 - w_content, 0)
+
+    row2 = [
+        ("│", colors.GRAY),
+        (s_node, colors.CYAN),
+        (div, colors.GRAY),
+        (s_up, colors.GREEN),
+        (div, colors.GRAY),
+        (s_down, colors.BLUE + colors.BOLD),
+    ]
+    if include_mode:
+        row2.extend([
+            (div, colors.GRAY),
+            (s_mode, colors.YELLOW),
         ])
-        added += 1
-    rows.append([(last_status or "状态栏：等待活动连接...", f"{colors.YELLOW}")])
-    total = sum(r["count"] for r in table.rows.values())
-    filter_txt = f"筛选:{proto_filter}" if proto_filter else "筛选:全部"
-    sort_txt = "排序:次数" if sort_mode == "count" else "排序:时间"
-    foot = (f"{keys_hint}"
-            f" | {filter_txt} {sort_txt}"
-            f" | 事件 {total} 行 {len(table.rows)}"
-            f" | up {format_bytes(up_spd)}/s down {format_bytes(down_spd)}/s")
-    rows.append([(foot, "")])
+    row2.extend([
+        (" " * rem_spaces, ""),
+        ("│", colors.GRAY),
+    ])
+    rows.append(row2)
+
+    # 2b. 订阅剩余流量栏 (醒目文字展示，无需图标)
+    with _SUB_TRAFFIC_LOCK:
+        st_up    = _SUB_TRAFFIC["upload"]
+        st_down  = _SUB_TRAFFIC["download"]
+        st_total = _SUB_TRAFFIC["total"]
+        st_exp   = _SUB_TRAFFIC["expire"]
+        st_at    = _SUB_TRAFFIC["fetched_at"]
+
+    if st_total > 0:
+        used = st_up + st_down
+        remain = max(st_total - used, 0)
+        pct = (used / st_total) * 100
+
+        tag_text = "【剩余流量】"
+        val_text = f" {format_bytes(remain)} "
+        val_color = colors.GREEN + colors.BOLD if pct < 80 else (colors.YELLOW + colors.BOLD if pct < 95 else colors.RED + colors.BOLD)
+
+        if width < 85:
+            s_used = f" 已用: {format_bytes(used)} "
+            s_total = f" 总量: {format_bytes(st_total)} "
+            s_ratio = f" 占比: {pct:.1f}% "
+        else:
+            s_used = f" 已用流量: {format_bytes(used)} "
+            s_total = f" 总额度: {format_bytes(st_total)} "
+            s_ratio = f" 已用占比: {pct:.1f}% "
+
+        row_tr = [
+            ("│", colors.GRAY),
+            (" ", ""),
+            (tag_text, colors.CYAN + colors.BOLD),
+            (val_text, val_color),
+            ("│", colors.GRAY),
+            (s_used, colors.WHITE),
+            ("│", colors.GRAY),
+            (s_total, colors.WHITE),
+            ("│", colors.GRAY),
+            (s_ratio, colors.YELLOW if pct >= 80 else colors.GRAY),
+        ]
+
+        if st_exp:
+            try:
+                exp_ts = int(st_exp)
+                if exp_ts > 0:
+                    exp_text = f" 到期时间: {time.strftime('%Y-%m-%d', time.localtime(exp_ts))} "
+                else:
+                    exp_text = ""
+            except Exception:
+                exp_text = f" 到期时间: {st_exp} "
+            if exp_text:
+                curr_w = sum(_disp_width(x[0]) for x in row_tr)
+                if curr_w + 1 + _disp_width(exp_text) <= width - 2:
+                    row_tr.extend([
+                        ("│", colors.GRAY),
+                        (exp_text, colors.CYAN),
+                    ])
+
+        curr_w = sum(_disp_width(x[0]) for x in row_tr)
+        rem_tr = max(width - 1 - curr_w, 0)
+        row_tr.extend([
+            (" " * rem_tr, ""),
+            ("│", colors.GRAY),
+        ])
+        rows.append(row_tr)
+    else:
+        status_tip = " 订阅剩余流量: 正在同步额度信息... " if st_at == 0.0 else " 订阅剩余流量: 暂未获取到额度数据 "
+        rem_f = max(width - 2 - _disp_width(status_tip), 0)
+        rows.append([
+            ("│", colors.GRAY),
+            (status_tip, colors.YELLOW if st_at == 0.0 else colors.GRAY),
+            (" " * rem_f, ""),
+            ("│", colors.GRAY),
+        ])
+
+    # 3. 选项卡分隔线
+    rows.append([
+        ("├─┬", colors.GRAY),
+        ("─" * (width - 4), colors.GRAY),
+        ("┤", colors.GRAY),
+    ])
+
+    # 4. 选项卡栏
+    t1_style = (colors.CYAN + colors.BOLD + colors.REVERSE) if active_tab == 1 else (colors.WHITE)
+    t2_style = (colors.CYAN + colors.BOLD + colors.REVERSE) if active_tab == 2 else (colors.WHITE)
+    t3_style = (colors.CYAN + colors.BOLD + colors.REVERSE) if active_tab == 3 else (colors.WHITE)
+    t4_style = (colors.CYAN + colors.BOLD + colors.REVERSE) if active_tab == 4 else (colors.WHITE)
+
+    if width < 95:
+        t1_txt = "[1]活动" if active_tab == 1 else " 1 活动"
+        t2_txt = "[2]日志" if active_tab == 2 else " 2 日志"
+        t3_txt = "[3]分流" if active_tab == 3 else " 3 分流"
+        t4_txt = "[4]节点" if active_tab == 4 else " 4 节点"
+    else:
+        t1_txt = " [1] 活动连接 " if active_tab == 1 else "  1  活动连接  "
+        t2_txt = " [2] 实时日志 " if active_tab == 2 else "  2  实时日志  "
+        t3_txt = " [3] 进程分流 " if active_tab == 3 else "  3  进程分流  "
+        t4_txt = " [4] 节点选择 " if active_tab == 4 else "  4  节点选择  "
+
+    tabs_w = _disp_width(t1_txt) + 1 + _disp_width(t2_txt) + 1 + _disp_width(t3_txt) + 1 + _disp_width(t4_txt)
+    badge_w = (_disp_width(extra_badge) + 1) if extra_badge else 0
+    if tabs_w + badge_w > width - 2:
+        extra_badge = ""
+        badge_w = 0
+    rem_tab_spaces = max(width - 2 - tabs_w - badge_w, 0)
+
+    row4 = [
+        ("│", colors.GRAY),
+        (t1_txt, t1_style),
+        ("│", colors.GRAY),
+        (t2_txt, t2_style),
+        ("│", colors.GRAY),
+        (t3_txt, t3_style),
+        ("│", colors.GRAY),
+        (t4_txt, t4_style),
+        (" " * rem_tab_spaces, ""),
+    ]
+    if extra_badge:
+        row4.append((extra_badge + " ", colors.GRAY))
+    row4.append(("│", colors.GRAY))
+    rows.append(row4)
+
     return rows
+
+
+def _build_frame(table, last_status, width, height, up, down, up_spd, down_spd,
+                 proto_filter=None, sort_mode="time", keys_hint="", seen_procs_cnt=0):
+    colors = Color()
+    filter_txt = f"筛选:{proto_filter}" if proto_filter else "筛选:全部"
+    sort_txt = "排序:频次" if sort_mode == "count" else "排序:时间"
+    badge = f"[{filter_txt} │ {sort_txt}]"
+
+    rows = _build_header_card(width, height, active_tab=1, up=up, down=down,
+                              up_spd=up_spd, down_spd=down_spd, extra_badge=badge)
+
+    # 列宽计算 (根据终端宽度自适应各列，支持窄屏模式)
+    if width < 90:
+        w_time = 8
+        w_proc = 10
+        w_node = 12
+        w_proto = 5
+        w_status = 9
+        w_count = 4
+    elif width < 110:
+        w_time = 8
+        w_proc = 12
+        w_node = 16
+        w_proto = 6
+        w_status = 10
+        w_count = 4
+    else:
+        w_time = 8
+        w_proc = 14
+        w_node = 18
+        w_proto = 6
+        w_status = 11
+        w_count = 5
+
+    overhead = 2 + (3 * 6) + 2  # 22
+    w_fixed = w_time + w_proc + w_node + w_proto + w_status + w_count + overhead
+    w_target = max(width - w_fixed, 6)
+    diff = width - (w_time + w_proc + w_node + w_target + w_proto + w_status + w_count + overhead)
+    w_target += diff
+
+    cols = [w_time, w_proc, w_node, w_target, w_proto, w_status, w_count]
+    col_div = _make_col_divider("├─┴─", "─┬─", "─┤", cols, width)
+    rows.append([(col_div, colors.GRAY)])
+
+    # 表头
+    rows.append([
+        ("│ ", colors.GRAY),
+        (_pad_disp("时间", w_time, "center"), colors.WHITE + colors.BOLD),
+        (" │ ", colors.GRAY),
+        (_pad_disp("进程名称", w_proc, "left"), colors.WHITE + colors.BOLD),
+        (" │ ", colors.GRAY),
+        (_pad_disp("出口节点", w_node, "left"), colors.WHITE + colors.BOLD),
+        (" │ ", colors.GRAY),
+        (_pad_disp("目标地址 (域名:端口)", w_target, "left"), colors.WHITE + colors.BOLD),
+        (" │ ", colors.GRAY),
+        (_pad_disp("协议", w_proto, "center"), colors.WHITE + colors.BOLD),
+        (" │ ", colors.GRAY),
+        (_pad_disp("状态", w_status, "center"), colors.WHITE + colors.BOLD),
+        (" │ ", colors.GRAY),
+        (_pad_disp("频次", w_count, "right"), colors.WHITE + colors.BOLD),
+        (" │", colors.GRAY),
+    ])
+
+    head_div = _make_col_divider("├─", "─┼─", "─┤", cols, width)
+    rows.append([(head_div, colors.GRAY)])
+
+    max_data = max(height - 11, 1)
+    items = list(table.rows.items())
+    if sort_mode == "count":
+        items = sorted(items, key=lambda kv: -kv[1]["count"])
+    else:
+        items = list(reversed(items))
+
+    if proto_filter:
+        items = [it for it in items if it[1]["proto"].upper() == proto_filter]
+
+    added = 0
+    if not items:
+        empty_row = (
+            "│ " + _pad_disp("⚡ 暂无活动连接，打开浏览器或应用程序访问网络即可在此捕获...", width - 4, "center") + " │"
+        )
+        rows.append([(empty_row, colors.GRAY)])
+        added = 1
+    else:
+        for key, r in items:
+            if added >= max_data:
+                break
+            proto = r["proto"].upper()
+            proto_c = colors.CYAN if "HTTP" in proto else (colors.MAGENTA if "TCP" in proto else colors.YELLOW)
+            cnt = r["count"]
+            if cnt >= 50:
+                cnt_c = colors.RED + colors.BOLD
+            elif cnt >= 10:
+                cnt_c = colors.YELLOW + colors.BOLD
+            elif cnt >= 2:
+                cnt_c = colors.GREEN + colors.BOLD
+            else:
+                cnt_c = colors.GRAY
+
+            node_disp = r["node_plain"]
+            node_c = colors.YELLOW if "DIRECT" in node_disp.upper() else colors.CYAN
+
+            # 状态判定
+            st = r.get("status", "ACTIVE")
+            if st == "CLOSED":
+                st_text = "❌ 断开" if w_status <= 10 else "❌ 异常断开"
+                st_color = colors.RED + colors.BOLD
+            elif st == "TIMEOUT":
+                st_text = "⏱ 超时" if w_status <= 10 else "⏱ 响应超时"
+                st_color = colors.MAGENTA + colors.BOLD
+            elif st == "FAIL":
+                st_text = "❌ 失败" if w_status <= 10 else "❌ 节点失败"
+                st_color = colors.RED + colors.BOLD
+            elif st == "FALLBACK":
+                st_text = "⚠️ 直连" if w_status <= 10 else "⚠️ 自动直连"
+                st_color = colors.YELLOW + colors.BOLD
+            elif st == "OK":
+                st_text = "✔ 正常" if w_status <= 10 else "✔ 正常连通"
+                st_color = colors.GREEN
+            else:
+                st_text = "⚡ 活跃" if w_status <= 10 else "⚡ 传输中"
+                st_color = colors.CYAN
+
+            row = [
+                ("│ ", colors.GRAY),
+                (_pad_disp(r["time"], w_time, "center"), colors.GRAY),
+                (" │ ", colors.GRAY),
+                (_pad_disp(f"[{r['proc']}]", w_proc, "left"), colors.GREEN),
+                (" │ ", colors.GRAY),
+                (_pad_disp(node_disp, w_node, "left"), node_c),
+                (" │ ", colors.GRAY),
+                (_pad_disp(r["target"], w_target, "left"), colors.WHITE),
+                (" │ ", colors.GRAY),
+                (_pad_disp(proto, w_proto, "center"), proto_c),
+                (" │ ", colors.GRAY),
+                (_pad_disp(st_text, w_status, "center"), st_color),
+                (" │ ", colors.GRAY),
+                (_pad_disp(f"x{cnt}", w_count, "right"), cnt_c),
+                (" │", colors.GRAY),
+            ]
+            rows.append(row)
+            added += 1
+
+    while added < max_data:
+        blank_line = "│" + (" " * (width - 2)) + "│"
+        rows.append([(blank_line, colors.GRAY)])
+        added += 1
+
+    # 底部通知与快捷键栏
+    status_div = "├─" + ("─" * (width - 4)) + "─┤"
+    rows.append([(status_div, colors.GRAY)])
+
+    if _TUN_MODE["active"]:
+        default_status = "🔔 状态: 服务正常运转中 (TUN 全局网络接管)"
+    else:
+        default_status = "🔔 状态: 服务正常运转中"
+    status_txt = last_status or default_status
+    status_line = "│ " + _pad_disp(status_txt, width - 4, "left") + " │"
+    rows.append([(status_line, colors.YELLOW)])
+
+    total_ev = sum(r["count"] for r in table.rows.values())
+    if width < 90:
+        left_keys = "╰─ [Q]退出 [Tab]视图 [4]节点 [S]排序 [F]过滤"
+        right_info = f"──[{len(table.rows)}条]─╯"
+    else:
+        left_keys = "╰─ [Q]退出  [Tab/2]日志  [3]分流  [4/N]选节点  [U]更新订阅  [S]排序  [F]过滤  [D]清空"
+        right_info = f"──[ 活动:{len(table.rows)} 总计:{total_ev} ]─╯"
+    rem_foot = max(width - _disp_width(left_keys) - _disp_width(right_info), 0)
+    rows.append([
+        (left_keys, colors.CYAN),
+        ("─" * rem_foot, colors.GRAY),
+        (right_info, colors.GRAY),
+    ])
+
+    return rows
+
+
+def _build_log_frame(recent_logs, last_status, width, height, up, down, up_spd, down_spd, conn_cnt=0, proc_cnt=0):
+    colors = Color()
+    badge = f"[共 {len(recent_logs)} 条日志]"
+    rows = _build_header_card(width, height, active_tab=2, up=up, down=down,
+                              up_spd=up_spd, down_spd=down_spd, extra_badge=badge)
+
+    rows.append([
+        ("├─┴", colors.GRAY),
+        ("─" * (width - 4), colors.GRAY),
+        ("┤", colors.GRAY),
+    ])
+
+    max_data = max(height - 9, 1)
+    lines = list(recent_logs)[-max_data:] if max_data > 0 else []
+
+    added = 0
+    if not lines:
+        empty_row = "│ " + _pad_disp("📜 暂无内核日志输出...", width - 4, "center") + " │"
+        rows.append([(empty_row, colors.GRAY)])
+        added = 1
+    else:
+        for t_str, line in lines:
+            c = colors.WHITE
+            if "[closed]" in line.lower():
+                c = colors.RED + colors.BOLD
+                tag = "CLOSED"
+            elif "[timeout]" in line.lower():
+                c = colors.MAGENTA + colors.BOLD
+                tag = "TIMEO "
+                tag_c = colors.MAGENTA + colors.REVERSE
+            elif "[fallback]" in line.lower():
+                c = colors.YELLOW + colors.BOLD
+                tag = "FALLBK"
+                tag_c = colors.YELLOW + colors.REVERSE
+            elif "[fail]" in line.lower() or "[x]" in line or "error" in line.lower():
+                c = colors.RED + colors.BOLD
+                tag = " FAIL "
+                tag_c = colors.RED + colors.REVERSE
+            elif "[success]" in line.lower():
+                c = colors.GREEN
+                tag = "  OK  "
+                tag_c = colors.GREEN + colors.REVERSE
+            elif "[i]" in line:
+                c = colors.CYAN
+                tag = " INFO "
+                tag_c = colors.CYAN + colors.REVERSE
+            elif "-->" in line:
+                c = colors.GREEN
+                tag = "ROUTE "
+                tag_c = colors.GREEN + colors.REVERSE
+            else:
+                tag = " LOG  "
+                tag_c = colors.GRAY + colors.REVERSE
+
+            w_prefix = len(f"│ {t_str} [{tag}] ")
+            w_line_max = max(width - 4 - w_prefix, 10)
+            disp_payload = _truncate(line, w_line_max)
+            rem = max(width - 2 - _disp_width(f" {t_str} [{tag}] {disp_payload} "), 0)
+
+            row = [
+                ("│ ", colors.GRAY),
+                (f"{t_str} ", colors.GRAY),
+                (f"[{tag}]", tag_c),
+                (f" {disp_payload}", c),
+                (" " * rem, ""),
+                ("│", colors.GRAY),
+            ]
+            rows.append(row)
+            added += 1
+
+    while added < max_data:
+        rows.append([("│" + (" " * (width - 2)) + "│", colors.GRAY)])
+        added += 1
+
+    rows.append([("├─" + ("─" * (width - 4)) + "─┤", colors.GRAY)])
+    status_txt = last_status or "🔔 提示: 按 [Tab] 或 [1] 返回表格视图，按 [D] 清空当前日志"
+    status_line = "│ " + _pad_disp(status_txt, width - 4, "left") + " │"
+    rows.append([(status_line, colors.YELLOW)])
+
+    left_keys = "╰─ [1/Tab]返回表格  [3/Enter]分流管理  [D]清空日志  [Q]退出"
+    right_info = f"──[ 日志总数: {len(recent_logs)} ]─╯"
+    rem_foot = max(width - _disp_width(left_keys) - _disp_width(right_info), 0)
+    rows.append([
+        (left_keys, colors.CYAN),
+        ("─" * rem_foot, colors.GRAY),
+        (right_info, colors.GRAY),
+    ])
+
+    return rows
+
+
+def _build_app_panel_frame(seen_procs, panel_idx, width, height, last_status,
+                           up=0, down=0, up_spd=0.0, down_spd=0.0):
+    colors = Color()
+    rules = rules_list()
+    procs = sorted(set(rules) | set(seen_procs),
+                   key=lambda p: (-seen_procs.get(p, 0), p))
+    badge = f"[已捕获 {len(procs)} 个进程 │ 定制 {len(rules)} 条]"
+    rows = _build_header_card(width, height, active_tab=3, up=up, down=down,
+                              up_spd=up_spd, down_spd=down_spd, extra_badge=badge)
+
+    w_idx = 6
+    w_proc = 20
+    w_rule = 24
+    w_cnt = 12
+    overhead = 2 + (3 * 4) + 2  # 16
+    w_status = max(width - (w_idx + w_proc + w_rule + w_cnt + overhead), 10)
+    w_status += (width - (overhead + w_idx + w_proc + w_rule + w_cnt + w_status))
+
+    cols = [w_idx, w_proc, w_rule, w_cnt, w_status]
+    col_div = _make_col_divider("├─┴─", "─┬─", "─┤", cols, width)
+    rows.append([(col_div, colors.GRAY)])
+
+    rows.append([
+        ("│ ", colors.GRAY),
+        (_pad_disp("序号", w_idx, "center"), colors.WHITE + colors.BOLD),
+        (" │ ", colors.GRAY),
+        (_pad_disp("进程名称 (EXE)", w_proc, "left"), colors.WHITE + colors.BOLD),
+        (" │ ", colors.GRAY),
+        (_pad_disp("当前分流策略", w_rule, "left"), colors.WHITE + colors.BOLD),
+        (" │ ", colors.GRAY),
+        (_pad_disp("历史捕获连接", w_cnt, "right"), colors.WHITE + colors.BOLD),
+        (" │ ", colors.GRAY),
+        (_pad_disp("规则状态", w_status, "center"), colors.WHITE + colors.BOLD),
+        (" │", colors.GRAY),
+    ])
+
+    head_div = _make_col_divider("├─", "─┼─", "─┤", cols, width)
+    rows.append([(head_div, colors.GRAY)])
+
+    max_data = max(height - 11, 1)
+    added = 0
+    if not procs:
+        empty_row = "│ " + _pad_disp("⚡ 暂无检测到的活动进程，请打开网络应用...", width - 4, "center") + " │"
+        rows.append([(empty_row, colors.GRAY)])
+        added = 1
+    else:
+        for i, p in enumerate(procs[:max_data]):
+            is_sel = (i == panel_idx)
+            mark = "❯ " if is_sel else "  "
+            idx_str = f"{mark}{i + 1:02d}"
+
+            r_rule = rules.get(p, "")
+            if r_rule.lower() == "direct":
+                rule_str = "⚡ 本地直连 (DIRECT)"
+                rule_c = colors.GREEN + colors.BOLD
+                status_badge = "已指定直连"
+            elif r_rule.lower() == "proxy":
+                rule_str = "🌐 节点代理 (PROXY)"
+                rule_c = colors.CYAN + colors.BOLD
+                status_badge = "已指定代理"
+            elif r_rule.lower() == "auto":
+                rule_str = "🚀 自动优选 (AUTO)"
+                rule_c = colors.MAGENTA + colors.BOLD
+                status_badge = "已指定优选"
+            elif r_rule:
+                rule_str = f"🎯 {r_rule}"
+                rule_c = colors.YELLOW + colors.BOLD
+                status_badge = "指定节点"
+            else:
+                rule_str = "跟随全局 (默认)"
+                rule_c = colors.GRAY
+                status_badge = "默认规则"
+
+            cnt = seen_procs.get(p, 0)
+
+            row = [
+                ("│ ", colors.GRAY),
+                (_pad_disp(idx_str, w_idx, "left"), colors.YELLOW + colors.BOLD if is_sel else colors.GRAY),
+                (" │ ", colors.GRAY),
+                (_pad_disp(f"[{p}]", w_proc, "left"), colors.GREEN + colors.BOLD if is_sel else colors.GREEN),
+                (" │ ", colors.GRAY),
+                (_pad_disp(rule_str, w_rule, "left"), rule_c),
+                (" │ ", colors.GRAY),
+                (_pad_disp(f"{cnt} 次", w_cnt, "right"), colors.WHITE),
+                (" │ ", colors.GRAY),
+                (_pad_disp(status_badge, w_status, "center"), colors.YELLOW if r_rule else colors.GRAY),
+                (" │", colors.GRAY),
+            ]
+            rows.append(row)
+            added += 1
+
+    while added < max_data:
+        rows.append([("│" + (" " * (width - 2)) + "│", colors.GRAY)])
+        added += 1
+
+    rows.append([("├─" + ("─" * (width - 4)) + "─┤", colors.GRAY)])
+    status_txt = last_status or "💡 操作指引: 使用 [↑/↓ 或 J/K] 选中进程，按数字键即时下发规则"
+    status_line = "│ " + _pad_disp(status_txt, width - 4, "left") + " │"
+    rows.append([(status_line, colors.YELLOW)])
+
+    if width < 96:
+        left_keys = "╰─ [↑/↓]选 [1]直连 [2]代理 [3]优选 [X]清 [Esc]返"
+        right_info = f"──[{len(rules)}/{len(procs)}]─╯"
+    else:
+        left_keys = "╰─ [↑/↓/J/K]移动  [1]直连  [2]走代理  [3]自动优选  [X]清除规则  [Esc/Enter]返回"
+        right_info = f"──[ 定制: {len(rules)}/{len(procs)} ]─╯"
+    rem_foot = max(width - _disp_width(left_keys) - _disp_width(right_info), 0)
+    rows.append([
+        (left_keys, colors.CYAN),
+        ("─" * rem_foot, colors.GRAY),
+        (right_info, colors.GRAY),
+    ])
+
+    return rows
+
+def _build_node_panel_frame(node_items, panel_idx, width, height, last_status,
+                            up=0, down=0, up_spd=0.0, down_spd=0.0):
+    colors = Color()
+    cur_name = ""
+    for n, is_cur in node_items:
+        if is_cur:
+            cur_name = n
+            break
+    badge = f"[共 {len(node_items)} 个节点 │ 当前: {cur_name[:14]}]" if cur_name else f"[共 {len(node_items)} 个节点]"
+    rows = _build_header_card(width, height, active_tab=4, up=up, down=down,
+                              up_spd=up_spd, down_spd=down_spd, extra_badge=badge)
+
+    w_idx = 6
+    w_status = 16
+    overhead = 2 + (2 * 3) + 2  # 10
+    w_name = max(width - (w_idx + w_status + overhead), 20)
+    w_name += (width - (overhead + w_idx + w_name + w_status))
+
+    cols = [w_idx, w_name, w_status]
+    col_div = _make_col_divider("├─", "─┬─", "─┤", cols, width)
+    rows.append([(col_div, colors.GRAY)])
+
+    rows.append([
+        ("│ ", colors.GRAY),
+        (_pad_disp("序号", w_idx, "center"), colors.WHITE + colors.BOLD),
+        (" │ ", colors.GRAY),
+        (_pad_disp("出站节点名称 (地区 / 线路特征)", w_name, "left"), colors.WHITE + colors.BOLD),
+        (" │ ", colors.GRAY),
+        (_pad_disp("运行状态", w_status, "center"), colors.WHITE + colors.BOLD),
+        (" │", colors.GRAY),
+    ])
+
+    head_div = _make_col_divider("├─", "─┼─", "─┤", cols, width)
+    rows.append([(head_div, colors.GRAY)])
+
+    max_data = max(height - 11, 1)
+    added = 0
+    if not node_items:
+        empty_row = "│ " + _pad_disp("⚡ 正在加载节点列表，请稍候...", width - 4, "center") + " │"
+        rows.append([(empty_row, colors.GRAY)])
+        added = 1
+    else:
+        start_idx = 0
+        if panel_idx >= max_data:
+            start_idx = min(panel_idx - max_data + 1, len(node_items) - max_data)
+            start_idx = max(0, start_idx)
+
+        visible_nodes = node_items[start_idx:start_idx + max_data]
+        for i_rel, (name, is_cur) in enumerate(visible_nodes):
+            i_abs = start_idx + i_rel
+            is_sel = (i_abs == panel_idx)
+            mark = "❯ " if is_sel else "  "
+            idx_str = f"{mark}{i_abs + 1:02d}"
+
+            if is_cur:
+                status_str = "● 当前使用中"
+                status_c = colors.GREEN + colors.BOLD
+                name_c = colors.GREEN + colors.BOLD if not is_sel else colors.YELLOW + colors.BOLD
+            else:
+                status_str = "回车立即切换" if is_sel else "○ 就绪"
+                status_c = colors.YELLOW + colors.BOLD if is_sel else colors.GRAY
+                name_c = colors.YELLOW + colors.BOLD if is_sel else colors.WHITE
+
+            row = [
+                ("│ ", colors.GRAY),
+                (_pad_disp(idx_str, w_idx, "left"), colors.YELLOW + colors.BOLD if is_sel else colors.GRAY),
+                (" │ ", colors.GRAY),
+                (_pad_disp(name, w_name, "left"), name_c),
+                (" │ ", colors.GRAY),
+                (_pad_disp(status_str, w_status, "center"), status_c),
+                (" │", colors.GRAY),
+            ]
+            rows.append(row)
+            added += 1
+
+    while added < max_data:
+        rows.append([("│" + (" " * (width - 2)) + "│", colors.GRAY)])
+        added += 1
+
+    rows.append([("├─" + ("─" * (width - 4)) + "─┤", colors.GRAY)])
+    status_txt = last_status or "💡 操作指引: 使用 [↑/↓ 或 J/K] 挑选目标节点，按 [Enter] 即可瞬间切换出站出口！"
+    status_line = "│ " + _pad_disp(status_txt, width - 4, "left") + " │"
+    rows.append([(status_line, colors.YELLOW)])
+
+    cur_pos = panel_idx + 1 if node_items else 0
+    if width < 95:
+        left_keys = "╰─ [↑/↓]选节点 [Enter]应用 [1]连接 [2]日志 [Esc]返"
+        right_info = f"──[{cur_pos}/{len(node_items)}]─╯"
+    else:
+        left_keys = "╰─ [↑/↓/J/K]挑选节点  [Enter]应用切换  [1]连接  [2]日志  [3]分流  [Esc]返回"
+        right_info = f"──[ 节点: {cur_pos}/{len(node_items)} ]─╯"
+    rem_foot = max(width - _disp_width(left_keys) - _disp_width(right_info), 0)
+    rows.append([
+        (left_keys, colors.CYAN),
+        ("─" * rem_foot, colors.GRAY),
+        (right_info, colors.GRAY),
+    ])
+
+    return rows
+
 
 def _poll_keys():
     keys = []
     try:
         while msvcrt.kbhit():
-            keys.append(msvcrt.getwch())
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):
+                if msvcrt.kbhit():
+                    ch2 = msvcrt.getwch()
+                    if ch2 == "H":
+                        keys.append("UP")
+                    elif ch2 == "P":
+                        keys.append("DOWN")
+                    elif ch2 == "K":
+                        keys.append("LEFT")
+                    elif ch2 == "M":
+                        keys.append("RIGHT")
+            elif ch == "\x1b":
+                keys.append("ESC")
+            elif ch == "\t":
+                keys.append("TAB")
+            elif ch == "\x03":
+                keys.append("CTRL_C")
+            else:
+                keys.append(ch)
     except Exception:
         pass
     return keys
+
 
 def restart_core():
     global _CORE_PROC
@@ -898,26 +1946,49 @@ def restart_core():
     if _CORE_PROC:
         _CORE_PROC.wait(timeout=5)
     time.sleep(0.5)
+    _CORE_STOP_EVENT.clear()
+    core.aether_core.CORE_STOP_EVENT.clear()
     _CORE_PROC = start_core()
     time.sleep(0.5)
-    set_system_proxy(True)
     return True
 
 _CORE_PROC = None
 
 
-def monitor_connections_loop(core_holder, stopping, log_fp, tray=None):
-    print(f"{Color.GREEN}[ok] Python 内核代理服务已就绪（系统代理 127.0.0.1:7899）！{Color.RESET}")
-    print(f"{Color.CYAN}[*] 实时监控各进程出口节点与连接（重复连接自动聚合计数 xN）...{Color.RESET}\n")
+def monitor_connections_loop(core_holder, stopping, log_fp):
+    global _CORE_PROC, _MONITOR_THREADS
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
     tui = None
-    try:
-        tui = Tui()
-    except Exception:
-        tui = None
+    worker_threads = []
+    _MONITOR_THREADS = worker_threads
+
+    def handle_sigint(signum, frame):
+        if not stopping.is_set():
+            if tui is None:
+                print(f"\n{Color.YELLOW}[*] 收到 Ctrl+C，正在退出...{Color.RESET}", flush=True)
+            else:
+                push_status("[*] 收到 Ctrl+C，正在退出...")
+            stopping.set()
+
+    signal.signal(signal.SIGINT, handle_sigint)
+    use_tui = "--no-tui" not in sys.argv and "--log" not in sys.argv
+    if use_tui:
+        try:
+            tui = Tui()
+        except Exception:
+            tui = None
+
+    mode_txt = "TUN 全局网络接管" if _TUN_MODE["active"] else "内核入站已就绪"
     if tui is not None:
-        threading.Thread(target=_traffic_stream, daemon=True, name="traffic").start()
+        print(f"{Color.GREEN}[ok] Python 内核代理服务已就绪（{mode_txt}）！{Color.RESET}")
+        print(f"{Color.CYAN}[*] 实时监控各进程出口节点与连接（重复连接自动聚合计数 xN）...{Color.RESET}\n")
+        traffic_thread = threading.Thread(target=_traffic_stream, daemon=True, name="traffic")
+        traffic_thread.start()
+        worker_threads.append(traffic_thread)
     else:
-        print(f"{Color.YELLOW}[i] 控制台 TUI 不可用，回退为普通文本输出。{Color.RESET}")
+        print(f"{Color.GREEN}[ok] Python 内核代理服务已就绪（{mode_txt}）！{Color.RESET}")
+        print(f"{Color.CYAN}[*] 实时日志滚动监听中（所有连接与内核事件自然向下滚动，按 Ctrl+C 退出）...{Color.RESET}\n")
+
     table = ConnectionTable()
     last_status = ""
     last_render = 0.0
@@ -926,14 +1997,65 @@ def monitor_connections_loop(core_holder, stopping, log_fp, tray=None):
     ema_up = ema_down = 0.0
     proto_filter = None
     sort_mode = "time"
-    log_events = 0
+    view_mode = "table"
     seen_procs = {}
     panel_active = False
     panel_idx = 0
-    log_fp_write = log_fp
+    node_panel_active = False
+    node_panel_idx = 0
+
+    # 启动内核日志流监听线程
+    log_thread = threading.Thread(
+        target=_log_stream,
+        args=(table, seen_procs, log_fp, stopping, lambda: tui is not None),
+        daemon=True,
+        name="log-stream"
+    )
+    log_thread.start()
+    worker_threads.append(log_thread)
+
+    # 启动订阅剩余流量后台刷新线程
+    sub_traffic_thread = threading.Thread(
+        target=_sub_traffic_loop,
+        args=(stopping,),
+        daemon=True,
+        name="sub-traffic"
+    )
+    sub_traffic_thread.start()
+    worker_threads.append(sub_traffic_thread)
+
+    # 启动 6 小时定时拉取订阅后台刷新线程
+    auto_update_thread = threading.Thread(
+        target=_auto_update_loop,
+        args=(stopping,),
+        daemon=True,
+        name="sub-auto-update"
+    )
+    auto_update_thread.start()
+    worker_threads.append(auto_update_thread)
 
     while not stopping.is_set():
         time.sleep(0.05)
+        if tui is None:
+            # 滚动日志模式：检测键盘按键 q 或 Ctrl+C 退出，u 手动更新订阅
+            if msvcrt.kbhit():
+                try:
+                    ch = msvcrt.getwch()
+                    if ch.lower() == "q" or ch == "\x03":
+                        stopping.set()
+                        break
+                    elif ch.lower() == "u":
+                        update_subscription_async("手动快捷键")
+                except Exception:
+                    pass
+            if core_holder.poll() is not None:
+                if tui is None:
+                    print(f"{Color.RED}[x] 内核进程已退出，正在重启...{Color.RESET}")
+                else:
+                    push_status("[x] 内核进程已退出，正在重启...")
+                _CORE_PROC = start_core()
+                time.sleep(0.5)
+            continue
         if tui is not None:
             now = time.time()
             up = TRAFFIC.get("up", 0)
@@ -956,69 +2078,191 @@ def monitor_connections_loop(core_holder, stopping, log_fp, tray=None):
             keys = _poll_keys()
             keys_hint = ""
             for k in keys:
-                if k == "p" and panel_active:
+                if k == "CTRL_C":
+                    push_status("[*] 收到 Ctrl+C，正在退出...")
+                    stopping.set()
+                    break
+                elif k in ("4", "n", "N"):
+                    node_panel_active = not node_panel_active
                     panel_active = False
-                elif k == "q":
-                    if panel_active:
+                    if node_panel_active:
+                        nodes = list_manual_nodes()
+                        for i, (nm, is_c) in enumerate(nodes):
+                            if is_c:
+                                node_panel_idx = i
+                                break
+                elif k == "TAB":
+                    if node_panel_active:
+                        node_panel_active = False
+                        view_mode = "table"
+                    elif panel_active:
                         panel_active = False
+                        view_mode = "table"
+                    elif view_mode == "table":
+                        view_mode = "logs"
+                    else:
+                        view_mode = "table"
+                elif k == "1":
+                    node_panel_active = False
+                    if panel_active:
+                        procs = sorted(set(rules_list()) | set(seen_procs), key=lambda p: (-seen_procs.get(p, 0), p))
+                        if 0 <= panel_idx < len(procs):
+                            set_app_target(procs[panel_idx], "direct")
+                            push_status(f"[ok] 已设置 {procs[panel_idx]} 为 本地直连")
+                    else:
+                        panel_active = False
+                        view_mode = "table"
+                elif k == "2":
+                    node_panel_active = False
+                    if panel_active:
+                        procs = sorted(set(rules_list()) | set(seen_procs), key=lambda p: (-seen_procs.get(p, 0), p))
+                        if 0 <= panel_idx < len(procs):
+                            set_app_target(procs[panel_idx], "proxy")
+                            push_status(f"[ok] 已设置 {procs[panel_idx]} 为 走代理")
+                    else:
+                        panel_active = False
+                        view_mode = "logs"
+                elif k == "3":
+                    node_panel_active = False
+                    if panel_active:
+                        procs = sorted(set(rules_list()) | set(seen_procs), key=lambda p: (-seen_procs.get(p, 0), p))
+                        if 0 <= panel_idx < len(procs):
+                            set_app_target(procs[panel_idx], "auto")
+                            push_status(f"[ok] 已设置 {procs[panel_idx]} 为 自动优选")
+                    else:
+                        panel_active = True
+                        panel_idx = 0
+                elif k.lower() == "l":
+                    node_panel_active = False
+                    panel_active = False
+                    view_mode = "logs" if view_mode == "table" else "table"
+                elif k.lower() == "t":
+                    node_panel_active = False
+                    panel_active = False
+                    view_mode = "table"
+                elif k in ("p", "ESC", "\x08"):
+                    if node_panel_active:
+                        node_panel_active = False
+                    elif panel_active:
+                        panel_active = False
+                    elif view_mode == "logs":
+                        view_mode = "table"
+                elif k == "q":
+                    if node_panel_active:
+                        node_panel_active = False
+                    elif panel_active:
+                        panel_active = False
+                    elif view_mode == "logs":
+                        view_mode = "table"
                     else:
                         stopping.set()
-                elif k == "j":
-                    if panel_active:
+                elif k in ("j", "DOWN"):
+                    if node_panel_active:
+                        nodes = list_manual_nodes()
+                        node_panel_idx = min(max(len(nodes) - 1, 0), node_panel_idx + 1)
+                    elif panel_active:
+                        procs_len = len(set(rules_list()) | set(seen_procs))
+                        panel_idx = min(max(procs_len - 1, 0), panel_idx + 1)
+                elif k in ("k", "UP"):
+                    if node_panel_active:
+                        node_panel_idx = max(0, node_panel_idx - 1)
+                    elif panel_active:
                         panel_idx = max(0, panel_idx - 1)
-                elif k == "k":
-                    if panel_active:
-                        panel_idx = min(len(seen_procs) - 1, panel_idx + 1)
-                elif k == "1" and panel_active:
-                    procs = sorted(seen_procs, key=lambda p: -seen_procs[p])
-                    if 0 <= panel_idx < len(procs):
-                        set_app_target(procs[panel_idx], "direct")
-                elif k == "2" and panel_active:
-                    procs = sorted(seen_procs, key=lambda p: -seen_procs[p])
-                    if 0 <= panel_idx < len(procs):
-                        set_app_target(procs[panel_idx], "proxy")
-                elif k == "3" and panel_active:
-                    procs = sorted(seen_procs, key=lambda p: -seen_procs[p])
-                    if 0 <= panel_idx < len(procs):
-                        set_app_target(procs[panel_idx], "auto")
-                elif k == "x" and panel_active:
-                    procs = sorted(seen_procs, key=lambda p: -seen_procs[p])
+                elif k.lower() == "x" and panel_active:
+                    procs = sorted(set(rules_list()) | set(seen_procs), key=lambda p: (-seen_procs.get(p, 0), p))
                     if 0 <= panel_idx < len(procs):
                         remove_app_target(procs[panel_idx])
-                elif k == "f":
+                        push_status(f"[ok] 已清除 {procs[panel_idx]} 的自定义规则")
+                elif k.lower() == "d":
+                    if view_mode == "logs":
+                        RECENT_LOGS.clear()
+                        push_status("[ok] 已清空实时内核日志")
+                    else:
+                        table.rows.clear()
+                        push_status("[ok] 已清空活动连接表")
+                elif k.lower() == "f":
                     if proto_filter is None:
                         proto_filter = "TCP"
                     elif proto_filter == "TCP":
                         proto_filter = "UDP"
                     else:
                         proto_filter = None
-                elif k == "s":
+                elif k.lower() == "s":
                     sort_mode = "count" if sort_mode == "time" else "time"
+                elif k.lower() == "u":
+                    update_subscription_async("手动快捷键")
                 elif k == "\r":
-                    panel_active = not panel_active
-                    panel_idx = 0
+                    if node_panel_active:
+                        nodes = list_manual_nodes()
+                        if 0 <= node_panel_idx < len(nodes):
+                            tgt_name = nodes[node_panel_idx][0]
+                            if select_manual_node(tgt_name):
+                                push_status(f"🌐 [ok] 已成功切换出站出口为: {tgt_name}")
+                                _NODE_CACHE["t"] = 0.0
+                            else:
+                                push_status(f"❌ [x] 切换节点失败: {tgt_name}")
+                        node_panel_active = False
+                    else:
+                        panel_active = not panel_active
+                        panel_idx = 0
                 keys_hint += repr(k).strip("'")
 
+            if stopping.is_set():
+                break
+
             w, h = tui.size()
-            if panel_active:
-                rows = _build_app_panel_frame(seen_procs, panel_idx, w, h, last_status)
+            eff_w = max(w - 1, 20)
+            if node_panel_active:
+                rows = _build_node_panel_frame(list_manual_nodes(), node_panel_idx, eff_w, h, last_status,
+                                              up, down, ema_up, ema_down)
+            elif panel_active:
+                rows = _build_app_panel_frame(seen_procs, panel_idx, eff_w, h, last_status,
+                                             up, down, ema_up, ema_down)
+            elif view_mode == "logs":
+                rows = _build_log_frame(RECENT_LOGS, last_status, eff_w, h, up, down, ema_up, ema_down,
+                                        len(table.rows), len(seen_procs))
             else:
-                rows = _build_frame(table, last_status, w, h, up, down, ema_up, ema_down,
-                                    proto_filter, sort_mode, keys_hint)
+                rows = _build_frame(table, last_status, eff_w, h, up, down, ema_up, ema_down,
+                                    proto_filter, sort_mode, keys_hint, len(seen_procs))
             tui.render(rows)
             last_render = now
 
-        if core_holder.poll() is not None:
-            print(f"{Color.RED}[x] 内核进程已退出，正在重启...{Color.RESET}")
-            start_core()
+        if _CORE_PROC and _CORE_PROC.poll() is not None:
+            push_status("[x] 内核进程已退出，正在重启...")
+            _CORE_PROC = start_core()
             time.sleep(0.5)
 
     if tui is not None:
         tui.close()
+    stopping.set()
+    _CORE_STOP_EVENT.set()
+    _join_monitor_threads()
+    signal.signal(signal.SIGINT, previous_sigint_handler)
+
+
+def _join_monitor_threads(timeout=3):
+    for worker_thread in list(_MONITOR_THREADS):
+        if worker_thread.is_alive():
+            worker_thread.join(timeout=timeout)
+    _MONITOR_THREADS.clear()
+
+
+def shutdown_runtime(stopping=None):
+    """统一停止核心和所有监控线程，保证退出路径幂等。"""
+    stop_tun_engine()
+    _CORE_STOP_EVENT.set()
+    if stopping is not None:
+        stopping.set()
+    import core.aether_core
+    core.aether_core.CORE_STOP_EVENT.set()
+    if _CORE_PROC:
+        _CORE_PROC.wait(timeout=5)
+    _join_monitor_threads()
 
 
 def main():
     global _CORE_PROC
+    disable_quick_edit()
     print(f"{Color.CYAN}{Color.BOLD}AetherCore - 纯 Python 透明代理网关{Color.RESET}")
     print(f"{Color.YELLOW}[*] 工作目录: {WORKSPACE_DIR}{Color.RESET}")
     print(f"{Color.YELLOW}[*] 数据目录: {DATA_DIR}{Color.RESET}")
@@ -1026,76 +2270,48 @@ def main():
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR, exist_ok=True)
 
-    if not ensure_single_instance(create=False):
-        print(f"{Color.RED}[x] 已有实例在运行，请先退出旧实例！{Color.RESET}")
-        return 1
-
     if not is_admin():
-        if not sys.argv[0].endswith(".py"):
-            elevate_admin()
-            return 0
-        else:
-            print(f"{Color.YELLOW}[!] 以非管理员权限运行，部分功能可能受限{Color.RESET}")
+        elevate_admin()
+        return 0
+
+    # 自动关闭正在运行的旧实例 / 内核残留进程，直接接管服务（无需用户手动退出旧实例）
+    killed = kill_old_instances()
+    if killed:
+        print(f"{Color.YELLOW}[*] 检测到已有旧实例正在运行，已自动关闭旧实例并接管服务{Color.RESET}")
 
     ensure_single_instance(create=True)
-
     kill_conflicting_proxies()
 
-    if core_already_running():
-        try:
-            ctypes.windll.user32.MessageBoxW(
-                None,
-                "检测到环境中已有一个 AetherCore 内核在运行\n"
-                "（通常是旧版本实例残留，正占用 TUN 网卡与端口，会导致新实例空转、无流量）。\n\n"
-                "请先在任务管理器结束旧的 python.exe / Python 内核进程，\n"
-                "或右键旧实例托盘图标选择【退出 AetherCore】，再重新启动。",
-                "AetherCore - 内核端口被占用", 0x10 | 0x40000)
-        except Exception:
-            show_console_window()
-            print(f"{Color.RED}[x] 端口已被旧内核占用，请先退出旧实例再启动！{Color.RESET}")
-        return 1
-
-    # 生成配置
-    ok, _ = run_gen(fetch=True, echo=True)
-    if not ok:
-        print(f"{Color.YELLOW}[!] 首次配置生成失败，使用缓存（如有）...{Color.RESET}")
+    # 生成配置：若已有本地 core.conf 则秒起，后台异步更新订阅；若不存在则同步生成
+    if os.path.exists(CORE_CONF) and os.path.getsize(CORE_CONF) > 0:
+        print(f"{Color.GREEN}[ok] 检测到已有内核配置，正在快速启动...{Color.RESET}")
+        update_subscription_async("启动后台")
+    else:
+        print(f"{Color.YELLOW}[*] 未检测到有效内核配置，正在拉取订阅...{Color.RESET}")
+        ok, _ = run_gen(fetch=True, echo=True)
+        if not ok:
+            print(f"{Color.YELLOW}[!] 首次配置生成失败，尝试从缓存生成...{Color.RESET}")
+            run_gen(fetch=False, echo=True)
 
     # 启动内核
     _CORE_PROC = start_core()
     time.sleep(0.5)
-    set_system_proxy(True)
 
-    # 启动托盘
-    tray = TrayBridge(
-        title="AetherCore 代理网关",
-        on_exit_callback=lambda: (
-            set_system_proxy(False),
-            _CORE_STOP_EVENT.set(),
-            setattr(__import__('core.aether_core'), 'CORE_STOP_EVENT', threading.Event()),
-            os._exit(0)
-        ),
-        on_reload_callback=lambda: (
-            run_gen(fetch=True, echo=False),
-            restart_core()
-        ),
-        on_autostart_callback=lambda: autostart_set(not autostart_is_enabled()),
-        on_list_nodes_callback=list_manual_nodes,
-        on_node_select_callback=select_manual_node,
-        on_list_app_rules_callback=lambda: [
-            (p, target_label(t), t) for p, t in rules_list().items()
-        ],
-        on_app_toggle_callback=lambda arg: (
-            set_app_target(*arg.split("=", 1)) if "=" in arg else remove_app_target(arg)
-        ),
-        on_reload_app_rules_callback=apply_app_rules_async,
-        on_console_callback=toggle_console_window,
-        console_visible_fn=console_visible,
-        on_open_logs_callback=open_logs_file,
-        autostart_enabled_fn=autostart_is_enabled,
-        autostart_enabled=autostart_is_enabled(),
-        start_hidden=False,
-    )
-    tray.start()
+    # TUN 全局网络接管
+    if parse_tun_enabled(CORE_CONF):
+        host, port = parse_listen_addr(CORE_CONF)
+        if not wait_core_listen(host, port):
+            print(f"{Color.RED}[x] 内核入站 ({host}:{port}) 未就绪，无法启动 TUN 引擎{Color.RESET}")
+        else:
+            try:
+                start_tun_engine()
+                _TUN_MODE["active"] = True
+                print(f"{Color.GREEN}[ok] TUN 全局接管已开启 (IPv4+IPv6, Fake-IP DNS){Color.RESET}")
+            except Exception as e:
+                _TUN_MODE["error"] = str(e)
+                print(f"{Color.RED}[x] TUN 模式启动失败: {e}{Color.RESET}")
+    else:
+        print(f"{Color.YELLOW}[!] TUN 模式已在 core.conf 中关闭 (tun off){Color.RESET}")
 
     # 打开日志文件
     log_fp = open(LOG_FILE, "a", encoding="utf-8", buffering=1) if not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) < LOG_MAX_BYTES else rotate_log(open(LOG_FILE, "a", encoding="utf-8", buffering=1))
@@ -1103,16 +2319,12 @@ def main():
     # 进入监控循环
     stopping = threading.Event()
     try:
-        monitor_connections_loop(_CORE_PROC, stopping, log_fp, tray)
+        monitor_connections_loop(_CORE_PROC, stopping, log_fp)
     except KeyboardInterrupt:
-        pass
+        print(f"\n{Color.YELLOW}[*] 收到 Ctrl+C，正在退出...{Color.RESET}", flush=True)
     finally:
         print(f"\n{Color.YELLOW}[*] 正在关闭...{Color.RESET}")
-        _CORE_STOP_EVENT.set()
-        import core.aether_core
-        core.aether_core.CORE_STOP_EVENT.set()
-        set_system_proxy(False)
-        tray.stop()
+        shutdown_runtime(stopping)
         try:
             log_fp.close()
         except Exception:

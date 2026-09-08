@@ -18,6 +18,15 @@
 
 import os
 import sys
+
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 import socket
 import struct
 import threading
@@ -66,7 +75,8 @@ class Config:
     __slots__ = ("listen_ip", "listen_port", "ctrl_ip", "ctrl_port",
                  "nodes", "node_count", "current_node",
                  "direct_domains", "proxy_domains",
-                 "direct_cidrs", "default_proxy")
+                 "direct_cidrs", "default_proxy",
+                 "direct_processes", "proxy_processes")
 
     def __init__(self):
         self.listen_ip = "127.0.0.1"
@@ -80,6 +90,8 @@ class Config:
         self.proxy_domains = []
         self.direct_cidrs = []
         self.default_proxy = True  # True=proxy, False=direct
+        self.direct_processes = []
+        self.proxy_processes = []
 
 
 # ---- 全局状态 ----
@@ -90,10 +102,37 @@ g_down_bytes = 0
 g_log_ring = []
 g_log_seq = 0
 g_log_lock = threading.Lock()
+g_data_dir = ""
+g_config_file = ""
+
+# TUN 模式客户端源端口到真实进程名映射
+_TUN_PORT_MAP = {}
+_TUN_PORT_LOCK = threading.Lock()
+
+
+def register_tun_client_port(local_port: int, proc_name: str):
+    """供 tun_tcp 桥接时登记发起程序的真实进程名"""
+    if not local_port or not proc_name or proc_name == "App":
+        return
+    with _TUN_PORT_LOCK:
+        _TUN_PORT_MAP[local_port] = (proc_name, time.time())
+        now = time.time()
+        stale = [p for p, (_, t) in _TUN_PORT_MAP.items() if now - t > 60]
+        for p in stale:
+            del _TUN_PORT_MAP[p]
+
+
+def get_tun_client_process(local_port: int) -> str:
+    """提取并移除指定端口关联的真实进程名"""
+    with _TUN_PORT_LOCK:
+        entry = _TUN_PORT_MAP.pop(local_port, None)
+        if entry:
+            return entry[0]
+    return ""
 
 
 def core_log(fmt: str, *args):
-    """记录日志到环形缓冲区"""
+    """记录日志到环形缓冲区与 core.log"""
     global g_log_seq
     msg = fmt % args if args else fmt
     with g_log_lock:
@@ -101,7 +140,62 @@ def core_log(fmt: str, *args):
         g_log_ring.append({"seq": g_log_seq, "line": msg})
         if len(g_log_ring) > LOG_RING_CAP:
             g_log_ring[:LOG_RING_CAP // 2] = []
-    print(f"[core] {msg}", flush=True)
+    if os.environ.get("AETHER_CORE_STDOUT", "0") == "1":
+        try:
+            print(f"[core] {msg}", flush=True)
+        except Exception:
+            pass
+
+    if g_data_dir:
+        try:
+            core_log_path = os.path.join(g_data_dir, "core.log")
+            with open(core_log_path, "a", encoding="utf-8", errors="replace") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [core] {msg}\n")
+        except Exception:
+            pass
+
+
+def get_process_for_port(port: int) -> str:
+    """Windows 获取指定本地 TCP 端口的进程名"""
+    if sys.platform != "win32" or port <= 0:
+        return "App"
+    try:
+        import ctypes
+        from ctypes import wintypes
+        TCP_TABLE_OWNER_PID_ALL = 5
+        AF_INET = 2
+        size = wintypes.DWORD(0)
+        ctypes.windll.iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0)
+        buf = ctypes.create_string_buffer(size.value)
+        if ctypes.windll.iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != 0:
+            return "App"
+        num = struct.unpack_from("I", buf, 0)[0]
+        offset = 4
+        pid = 0
+        for _ in range(num):
+            state, laddr, lport, raddr, rport, owning_pid = struct.unpack_from("6I", buf, offset)
+            net_port = socket.ntohs(lport & 0xFFFF)
+            if net_port == port:
+                pid = owning_pid
+                break
+            offset += 24
+        if pid <= 0:
+            return "App"
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return "App"
+        try:
+            name_buf = ctypes.create_unicode_buffer(512)
+            name_size = wintypes.DWORD(512)
+            if ctypes.windll.kernel32.QueryFullProcessImageNameW(h, 0, name_buf, ctypes.byref(name_size)):
+                return os.path.basename(name_buf.value)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    except Exception:
+        pass
+    return "App"
 
 
 def traffic_add(is_up: bool, n: int):
@@ -115,12 +209,12 @@ def traffic_add(is_up: bool, n: int):
 
 # ---- 配置加载 ----
 def load_config(path: str) -> bool:
-    """加载 core.conf 配置"""
-    global g_cfg
+    """加载 core.conf 配置 (支持原子热重载)"""
+    global g_cfg, g_config_file
     if not os.path.exists(path):
         return False
 
-    g_cfg = Config()
+    new_cfg = Config()
 
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -136,12 +230,12 @@ def load_config(path: str) -> bool:
                 cmd = parts[0].strip()
 
                 if cmd == "listen" and len(parts) >= 3:
-                    g_cfg.listen_ip = parts[1].strip()
-                    g_cfg.listen_port = int(parts[2].strip())
+                    new_cfg.listen_ip = parts[1].strip()
+                    new_cfg.listen_port = int(parts[2].strip())
                 elif cmd == "controller" and len(parts) >= 3:
-                    g_cfg.ctrl_ip = parts[1].strip()
-                    g_cfg.ctrl_port = int(parts[2].strip())
-                elif cmd == "node" and len(parts) >= 5 and g_cfg.node_count < MAX_NODES:
+                    new_cfg.ctrl_ip = parts[1].strip()
+                    new_cfg.ctrl_port = int(parts[2].strip())
+                elif cmd == "node" and len(parts) >= 5 and new_cfg.node_count < MAX_NODES:
                     n = Node()
                     n.name = parts[1].strip()
                     n.uuid = parts[2].strip()
@@ -155,33 +249,52 @@ def load_config(path: str) -> bool:
                         n.sni = n.server
                     if len(parts) >= 8 and parts[7].strip():
                         n.ws = True
-                        n.ws_path = parts[7].strip()
-                        n.ws_host = parts[8].strip() if len(parts) >= 9 else n.sni
-                    g_cfg.nodes.append(n)
-                    g_cfg.node_count += 1
+                        n.ws_path = parts[7].strip().rstrip("}, \t\r\n")
+                        n.ws_host = parts[8].strip().rstrip("}, \t\r\n") if len(parts) >= 9 else n.sni
+                    new_cfg.nodes.append(n)
+                    new_cfg.node_count += 1
                 elif cmd == "direct-domain" and len(parts) >= 2:
                     d = parts[1].strip()
-                    if d not in g_cfg.direct_domains:
-                        g_cfg.direct_domains.append(d)
+                    if d not in new_cfg.direct_domains:
+                        new_cfg.direct_domains.append(d)
                 elif cmd == "proxy-domain" and len(parts) >= 2:
                     d = parts[1].strip()
-                    if d not in g_cfg.proxy_domains:
-                        g_cfg.proxy_domains.append(d)
+                    if d not in new_cfg.proxy_domains:
+                        new_cfg.proxy_domains.append(d)
                 elif cmd == "direct-ip" and len(parts) >= 2:
                     try:
                         cidr = ipaddress.IPv4Network(parts[1].strip(), strict=False)
-                        g_cfg.direct_cidrs.append(cidr)
+                        new_cfg.direct_cidrs.append(cidr)
                     except ValueError:
                         pass
                 elif cmd == "default" and len(parts) >= 2:
-                    g_cfg.default_proxy = parts[1].strip().lower() == "proxy"
-                elif cmd in ("direct-process", "proxy-process") and len(parts) >= 2:
-                    pass  # 分应用规则由 launcher 管理，内核仅做域名/IP 分流
+                    new_cfg.default_proxy = parts[1].strip().lower() == "proxy"
+                elif cmd == "direct-process" and len(parts) >= 2:
+                    p = parts[1].strip().lower()
+                    if p not in new_cfg.direct_processes:
+                        new_cfg.direct_processes.append(p)
+                elif cmd == "proxy-process" and len(parts) >= 2:
+                    p = parts[1].strip().lower()
+                    if p not in new_cfg.proxy_processes:
+                        new_cfg.proxy_processes.append(p)
     except (OSError, ValueError) as e:
         core_log(f"[x] 配置加载失败: {e}")
         return False
 
-    return g_cfg.node_count > 0 or not g_cfg.default_proxy
+    if new_cfg.node_count == 0 and new_cfg.default_proxy:
+        return False
+
+    # 尽量保留旧配置选中的节点
+    if g_cfg and g_cfg.nodes and 0 <= g_cfg.current_node < len(g_cfg.nodes):
+        old_name = g_cfg.nodes[g_cfg.current_node].name
+        for i, n in enumerate(new_cfg.nodes):
+            if n.name == old_name:
+                new_cfg.current_node = i
+                break
+
+    g_cfg = new_cfg
+    g_config_file = os.path.abspath(path)
+    return True
 
 
 # ---- 域名匹配 ----
@@ -235,18 +348,92 @@ def is_ip_str(host: str) -> bool:
     return False
 
 
+# ---- 动态直连自愈缓存 ----
+g_dynamic_direct = set()
+g_dynamic_lock = threading.Lock()
+
+NEVER_DIRECT_DOMAINS = (
+    "google.com", "googleapis.com", "gstatic.com", "google.dev", "google",
+    "googleusercontent.com", "googlevideo.com", "youtube.com", "ytimg.com",
+    "github.com", "githubusercontent.com", "openai.com", "anthropic.com",
+    "claude.ai", "chatgpt.com", "twitter.com", "x.com", "telegram.org",
+    "wikipedia.org", "wikimedia.org"
+)
+
+def add_dynamic_direct(host: str):
+    """动态记录异常断开的域名，自动加入直连自愈列表（阻断/AI域名除外，避免泄漏国内IP）"""
+    h = host.split(":")[0].strip().lower()
+    if not h:
+        return
+    for blk in NEVER_DIRECT_DOMAINS:
+        if h == blk or h.endswith("." + blk):
+            return
+    with g_dynamic_lock:
+        if h not in g_dynamic_direct:
+            g_dynamic_direct.add(h)
+            core_log(f"[FALLBACK] host {h} added to dynamic direct whitelist")
+
+
 # ---- 规则决策 ----
-def decide_route(host: str, port: int) -> tuple:
+def decide_route(host: str, port: int, proc_name: str = None) -> tuple:
     """
     路由决策
     返回 (is_proxy: bool, node_name: str or None)
     """
+    if proc_name:
+        p_low = proc_name.lower().strip()
+        # 1. 优先查 app_rules.json
+        if g_data_dir:
+            try:
+                from core.aether_rules import rules_get
+                app_rule = rules_get(p_low, g_data_dir)
+                if app_rule:
+                    app_rule = app_rule.lower().strip()
+                    if app_rule == "direct":
+                        return False, None
+                    elif app_rule in ("proxy", "auto"):
+                        return True, g_cfg.nodes[g_cfg.current_node].name if g_cfg.nodes else None
+                    else:
+                        for n in g_cfg.nodes:
+                            if n.name.lower() == app_rule:
+                                return True, n.name
+                        return True, g_cfg.nodes[g_cfg.current_node].name if g_cfg.nodes else None
+            except Exception:
+                pass
+
+        # 2. 检查 core.conf 中定义的 direct-process / proxy-process
+        if p_low in g_cfg.direct_processes:
+            return False, None
+        if p_low in g_cfg.proxy_processes:
+            return True, g_cfg.nodes[g_cfg.current_node].name if g_cfg.nodes else None
+
+    # 3. 优先检查自愈动态直连缓存
+    h_clean = host.split(":")[0].strip().lower()
+    with g_dynamic_lock:
+        if h_clean in g_dynamic_direct:
+            return False, None
+        for d in g_dynamic_direct:
+            if domain_suffix_match(h_clean, d):
+                return False, None
+
+    # 4. 域名分流规则
     if match_domains(host, g_cfg.direct_domains):
         return False, None
     if match_domains(host, g_cfg.proxy_domains):
         return True, g_cfg.nodes[g_cfg.current_node].name if g_cfg.nodes else None
-    if is_ip_str(host) and match_cidrs(host):
-        return False, None
+
+    # 5. IP / CIDR / GeoIP 分流规则
+    if is_ip_str(host):
+        if match_cidrs(host):
+            return False, None
+        try:
+            from core.aether_geoip import is_cn
+            if is_cn(host, g_data_dir):
+                return False, None
+        except Exception:
+            pass
+
+    # 6. 默认动作
     if g_cfg.default_proxy and g_cfg.node_count > 0:
         return True, g_cfg.nodes[g_cfg.current_node].name
     return False, None
@@ -291,16 +478,111 @@ def vless_build_header(node: Node, host: str, port: int) -> bytes:
 
 
 # ---- 出站连接 ----
-def dial_host(host: str, port: int, timeout: float = HANDSHAKE_TIMEOUT) -> socket.socket:
-    """建立 TCP 出站连接"""
+FAKE_V4_NET_STR = "198.18.0.0/15"   # TUN Fake-IPv4 网段 (与 aether_tun.py 一致)
+FAKE_V6_NET_STR = "fdfe:dcba:9876::/48"
+
+
+def _is_fake_ip(host: str) -> bool:
+    """判断地址是否落在 TUN Fake-IP 网段 (回流防护)"""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if ":" not in host:
+            return ipaddress.IPv4Address(host) in ipaddress.IPv4Network(FAKE_V4_NET_STR)
+        return ipaddress.IPv6Address(host) in ipaddress.IPv6Network(FAKE_V6_NET_STR)
+    except Exception:
+        return False
+
+
+def _tun_dns_resolve(host: str) -> str:
+    """TUN 模式下的直连域名解析: 经物理网卡向上游 UDP DNS 查询 A 记录。
+
+    绕过系统解析器——TUN 模式下系统 DNS 已被 Fake-IP 劫持，getaddrinfo 会
+    返回 198.18.x.x 导致直连目标回流 TUN 形成循环。失败返回 None。
+    """
+    bind_ip = os.environ.get("AETHER_BIND_IP")
+    upstream = os.environ.get("AETHER_DNS_UPSTREAM", "223.5.5.5")
+    try:
+        txid = random.getrandbits(16)
+        qname = b"".join(bytes([len(l)]) + l.encode() for l in host.split(".")) + b"\x00"
+        query = struct.pack(">HHHHHH", txid, 0x0100, 1, 0, 0, 0) + qname + struct.pack(">HH", 1, 1)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2.0)
+        if bind_ip:
+            s.bind((bind_ip, 0))
+        s.sendto(query, (upstream, 53))
+        data, _ = s.recvfrom(4096)
+        s.close()
+        if len(data) < 12 or struct.unpack(">H", data[:2])[0] != txid:
+            return None
+        ancount = struct.unpack(">H", data[6:8])[0]
+        # 跳过 Question
+        off = 12
+        while off < len(data) and data[off] != 0:
+            off += 1 + data[off]
+        off += 5
+        # 解析 Answer 中的 A 记录
+        for _ in range(ancount):
+            if off >= len(data):
+                break
+            if data[off] & 0xC0 == 0xC0:
+                off += 2
+            else:
+                while off < len(data) and data[off] != 0:
+                    off += 1 + data[off]
+                off += 1
+            atype, _aclass, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+            off += 10
+            if atype == 1 and rdlen == 4:
+                return socket.inet_ntoa(data[off:off + 4])
+            off += rdlen
+    except Exception:
+        pass
+    return None
+
+
+def dial_host(host: str, port: int, timeout: float = HANDSHAKE_TIMEOUT) -> socket.socket:
+    """建立 TCP 出站连接 (支持 IPv4/IPv6，含 TUN 物理出口绑定防回环)"""
+    if _is_fake_ip(host):
+        raise ConnectionError(f"refusing to dial Fake-IP {host} (TUN 回流防护)")
+
+    bind_ip = os.environ.get("AETHER_BIND_IP")
+    bind_ip6 = os.environ.get("AETHER_BIND_IP6")
+    tun_mode = os.environ.get("AETHER_TUN") == "1"
+
+    is_v6 = ":" in host
+    fam = socket.AF_INET6 if is_v6 else socket.AF_INET
+
+    try:
+        s = socket.socket(fam, socket.SOCK_STREAM)
         s.settimeout(timeout)
+        if tun_mode:
+            if is_v6:
+                if bind_ip6:
+                    try:
+                        s.bind((bind_ip6, 0))
+                    except OSError:
+                        pass
+            elif bind_ip:
+                if not _is_ip_literal(host):
+                    resolved = _tun_dns_resolve(host)
+                    if resolved:
+                        host = resolved
+                try:
+                    s.bind((bind_ip, 0))
+                except OSError:
+                    pass
         s.connect((host, port))
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         return s
     except Exception:
         raise
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.IPv4Address(host)
+        return True
+    except Exception:
+        return False
 
 
 # ---- WebSocket 帧 ----
@@ -351,11 +633,8 @@ def _ws_read_frame(sock: socket.socket) -> tuple:
             return None, None
         length = struct.unpack(">Q", ext)[0]
 
-    if opcode == 0x8:  # Close
-        return opcode, None
-    if opcode == 0x9:  # Ping
-        return opcode, None
-    if opcode == 0xA:  # Pong
+    # 控制帧 (Close, Ping, Pong) 读取载荷
+    if opcode in (0x8, 0x9, 0xA):
         payload = _recv_all(sock, length) if length > 0 else b""
         return opcode, payload
 
@@ -382,6 +661,9 @@ class Chan:
         self.tls = False
         self.ws = False
         self.ws_buffer = b""
+        self.in_buffer = bytearray()
+        self.vless = False
+        self.vless_resp_read = False
         self.lock = threading.Lock()
 
     def send(self, data: bytes):
@@ -392,8 +674,7 @@ class Chan:
             else:
                 self.sock.sendall(data)
 
-    def recv(self, max_size: int = 65536) -> bytes:
-        """接收数据"""
+    def _recv_raw(self, max_size: int = 65536) -> bytes:
         if self.ws:
             while True:
                 if self.ws_buffer:
@@ -401,13 +682,16 @@ class Chan:
                     self.ws_buffer = self.ws_buffer[max_size:]
                     return chunk
                 opcode, payload = _ws_read_frame(self.sock)
-                if opcode == 0x8:  # Close
+                if opcode is None or opcode == 0x8:  # Error or Close
                     return b""
                 if opcode == 0x9:  # Ping
-                    # 回复 Pong
-                    pong = _ws_build_frame(b"", 0x0A)
+                    # 回复 Pong (RFC 6455 规范：Pong 载荷必须与 Ping 一致)
+                    pong = _ws_build_frame(payload or b"", 0x0A)
                     with self.lock:
-                        self.sock.sendall(pong)
+                        try:
+                            self.sock.sendall(pong)
+                        except Exception:
+                            pass
                     continue
                 if opcode == 0x0A:  # Pong
                     continue
@@ -419,6 +703,33 @@ class Chan:
                 return b""
         else:
             return self.sock.recv(max_size)
+
+    def recv(self, max_size: int = 65536) -> bytes:
+        """接收数据（自动剥离 VLESS 协议响应头）"""
+        if self.vless and not self.vless_resp_read:
+            # VLESS 服务端响应头规范：version (1B) + addon_length (1B) + addons (addon_length B)
+            while len(self.in_buffer) < 2:
+                chunk = self._recv_raw(max_size)
+                if not chunk:
+                    return b""
+                self.in_buffer.extend(chunk)
+            addon_len = self.in_buffer[1]
+            hdr_len = 2 + addon_len
+            while len(self.in_buffer) < hdr_len:
+                chunk = self._recv_raw(max_size)
+                if not chunk:
+                    return b""
+                self.in_buffer.extend(chunk)
+            # 剥离 VLESS 响应头
+            del self.in_buffer[:hdr_len]
+            self.vless_resp_read = True
+
+        if self.in_buffer:
+            chunk = bytes(self.in_buffer[:max_size])
+            del self.in_buffer[:max_size]
+            return chunk
+
+        return self._recv_raw(max_size)
 
     def close(self):
         """关闭通道"""
@@ -463,12 +774,15 @@ def _tls_handshake(sock: socket.socket, sni: str) -> ssl.SSLContext:
 
 
 # ---- WebSocket 握手 ----
-def _ws_handshake(sock: socket.socket, path: str, host: str) -> bool:
-    """WebSocket 握手"""
+def _ws_handshake(sock: socket.socket, path: str, host: str) -> tuple:
+    """WebSocket 握手，返回 (success: bool, leftover_bytes: bytes)"""
     key = base64.b64encode(bytes(random.randint(0, 255) for _ in range(16))).decode()
+    h = host.strip().rstrip("}, \t\r\n")
+    p = path.strip().rstrip("}, \t\r\n") or "/"
     request = (
-        f"GET {path or '/'} HTTP/1.1\r\n"
-        f"Host: {host}\r\n"
+        f"GET {p} HTTP/1.1\r\n"
+        f"Host: {h}\r\n"
+        f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
         f"Upgrade: websocket\r\n"
         f"Connection: Upgrade\r\n"
         f"Sec-WebSocket-Key: {key}\r\n"
@@ -479,14 +793,26 @@ def _ws_handshake(sock: socket.socket, path: str, host: str) -> bool:
     # 读取响应
     resp = b""
     while True:
-        chunk = sock.recv(4096)
+        try:
+            chunk = sock.recv(4096)
+        except Exception:
+            chunk = None
         if not chunk:
-            return False
+            return False, b""
         resp += chunk
         if b"\r\n\r\n" in resp:
             break
 
-    return b"101" in resp
+    idx = resp.find(b"\r\n\r\n")
+    headers = resp[:idx]
+    leftover = resp[idx + 4:]
+
+    if b"101" in headers:
+        return True, leftover
+    else:
+        first_line = headers.split(b"\r\n")[0].decode("ascii", errors="replace") if headers else "empty"
+        core_log(f"[x] WebSocket rejected: {first_line}")
+        return False, b""
 
 
 # ---- 节点连接 ----
@@ -514,16 +840,41 @@ def node_open(host: str, port: int, node_name: str = None) -> Chan:
         ch.tls = True
 
     if node.ws:
-        if not _ws_handshake(ch.sock, node.ws_path, node.ws_host):
+        ok, leftover = _ws_handshake(ch.sock, node.ws_path, node.ws_host)
+        if not ok:
             ch.close()
             raise ConnectionError("WebSocket handshake failed")
         ch.ws = True
+        if leftover:
+            ch.in_buffer.extend(leftover)
+
+    # 标记为 VLESS 节点，启用 2 字节响应头自动剥离
+    ch.vless = True
 
     # 发送 VLESS 头
     vh = vless_build_header(node, host, port)
     ch.send(vh)
 
+    # 握手完成，将 socket 切换为长连接保活模式
+    try:
+        ch.sock.settimeout(120.0)
+    except Exception:
+        pass
+
     return ch
+
+
+def node_open_retry(host: str, port: int, node_name: str = None, attempts: int = 2) -> Chan:
+    """建立代理通道，失败后快速重连，最后将错误交给上层降级处理。"""
+    last_error = None
+    for attempt in range(max(1, attempts)):
+        try:
+            return node_open(host, port, node_name)
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(0.1)
+    raise last_error
 
 
 # ---- 直连通道 ----
@@ -534,41 +885,96 @@ def chan_outbound(host: str, port: int) -> Chan:
     return Chan(sock)
 
 
+def chan_outbound_retry(host: str, port: int, attempts: int = 2) -> Chan:
+    """建立直连通道，失败后快速重连。"""
+    last_error = None
+    for attempt in range(max(1, attempts)):
+        try:
+            return chan_outbound(host, port)
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(0.1)
+    raise last_error
+
+
 # ---- 通道中继 ----
-def relay_tunnel(client: socket.socket, ch: Chan, is_up: bool = True):
-    """双向中继客户端 ↔ 节点通道"""
+def relay_tunnel(client: socket.socket, ch: Chan, is_up: bool = True, timeout: float = 20.0):
+    """双向中继客户端 ↔ 节点通道，支持防死锁双向掐断与超时检测，返回 (bytes_up, bytes_down, err_msg)"""
+    bytes_up = 0
+    bytes_down = 0
+    err_up = None
+    err_down = None
+    done_event = threading.Event()
+
+    # 针对双端设置合理的数据流超时（20 秒），防止节点假死时浏览器提前报错 ERR_TIMED_OUT
+    try:
+        client.settimeout(timeout)
+        ch.sock.settimeout(timeout)
+    except Exception:
+        pass
 
     def upstream():
-        """客户端 -> 节点"""
+        nonlocal bytes_up, err_up
         try:
-            while g_running and not CORE_STOP_EVENT.is_set():
-                data = client.recv(16384)
+            while g_running and not CORE_STOP_EVENT.is_set() and not done_event.is_set():
+                try:
+                    data = client.recv(16384)
+                except socket.timeout:
+                    if bytes_up == 0 and bytes_down == 0:
+                        err_up = "timed out"
+                    break
+                except Exception as e:
+                    err_up = str(e)
+                    break
                 if not data:
                     break
                 ch.send(data)
+                bytes_up += len(data)
                 traffic_add(is_up, len(data))
-        except Exception:
-            pass
+        except Exception as e:
+            err_up = str(e)
         finally:
+            done_event.set()
             try:
-                client.shutdown(socket.SHUT_WR)
+                ch.close()
             except Exception:
                 pass
 
     def downstream():
-        """节点 -> 客户端"""
+        nonlocal bytes_down, err_down
         try:
-            while g_running and not CORE_STOP_EVENT.is_set():
-                data = ch.recv(16384)
+            while g_running and not CORE_STOP_EVENT.is_set() and not done_event.is_set():
+                try:
+                    data = ch.recv(16384)
+                except socket.timeout:
+                    err_down = "timed out"
+                    break
+                except Exception as e:
+                    err_down = str(e)
+                    break
                 if not data:
                     break
-                client.sendall(data)
+                try:
+                    client.sendall(data)
+                except Exception as e:
+                    err_down = str(e)
+                    break
+                bytes_down += len(data)
                 traffic_add(not is_up, len(data))
-        except Exception:
-            pass
+                # 收到服务端首包响应后，放宽空闲超时至 300 秒，支持长连接 (WebSocket / SSE / 大文件流式下载)
+                if bytes_down > 0:
+                    try:
+                        ch.sock.settimeout(300.0)
+                        client.settimeout(300.0)
+                    except Exception:
+                        pass
+        except Exception as e:
+            err_down = str(e)
         finally:
+            done_event.set()
             try:
-                client.shutdown(socket.SHUT_WR)
+                client.close()
             except Exception:
                 pass
 
@@ -579,9 +985,41 @@ def relay_tunnel(client: socket.socket, ch: Chan, is_up: bool = True):
     up.join()
     down.join()
 
+    return bytes_up, bytes_down, err_down or err_up
+
+
+def _report_relay_result(proc_name: str, host: str, port: int, use_proxy: bool, bytes_up: int, bytes_down: int, err: str = None):
+    """统一分析并汇报中继结果，精准捕获 ERR_CONNECTION_CLOSED 与 ERR_TIMED_OUT 并自动切换直连"""
+    is_timeout = bool(err and "timed out" in str(err).lower())
+
+    if is_timeout:
+        if use_proxy:
+            core_log(f"[TIMEOUT] ({proc_name}) {host}:{port} proxy response timed out (ERR_TIMED_OUT)")
+            add_dynamic_direct(host)
+            core_log(f"[FALLBACK] ({proc_name}) {host}:{port} auto-fallback to DIRECT")
+        else:
+            core_log(f"[TIMEOUT] ({proc_name}) {host}:{port} direct connection timed out (ERR_TIMED_OUT)")
+    elif bytes_up > 0 and bytes_down == 0:
+        if use_proxy:
+            core_log(f"[CLOSED] ({proc_name}) {host}:{port} proxy terminated by remote (ERR_CONNECTION_CLOSED)")
+            add_dynamic_direct(host)
+            core_log(f"[FALLBACK] ({proc_name}) {host}:{port} auto-fallback to DIRECT")
+        else:
+            core_log(f"[CLOSED] ({proc_name}) {host}:{port} direct terminated by remote")
+    elif bytes_up == 0 and bytes_down == 0:
+        # 空连接提前掐断或等待首包超时
+        if use_proxy:
+            core_log(f"[TIMEOUT] ({proc_name}) {host}:{port} connection closed with 0B (ERR_TIMED_OUT)")
+            add_dynamic_direct(host)
+            core_log(f"[FALLBACK] ({proc_name}) {host}:{port} auto-fallback to DIRECT")
+        else:
+            core_log(f"[CLOSED] ({proc_name}) {host}:{port} direct closed with 0B")
+    else:
+        core_log(f"[SUCCESS] ({proc_name}) {host}:{port} up={bytes_up}B down={bytes_down}B")
+
 
 # ---- SOCKS5 处理 ----
-def handle_socks5(client: socket.socket, client_ip: str):
+def handle_socks5(client: socket.socket, client_ip: str, client_port: int = 0):
     """处理 SOCKS5 代理请求"""
     try:
         # 读取 methods
@@ -635,19 +1073,45 @@ def handle_socks5(client: socket.socket, client_ip: str):
             return
         port = (portb[0] << 8) | portb[1]
 
+        tun_proc = get_tun_client_process(client_port) if client_port else ""
+        proc_name = tun_proc or (get_process_for_port(client_port) if client_port else "")
+        use_proxy, node_name = decide_route(host, port, proc_name)
+        log_conn("TCP", client_ip, client_port, host, port, use_proxy, node_name, proc_name)
+
+        ch = None
+        if use_proxy and g_cfg.node_count > 0:
+            try:
+                ch = node_open_retry(host, port, node_name)
+            except Exception as e:
+                core_log(f"[FAIL] ({proc_name}) {host}:{port} proxy connect failed: {e}")
+                core_log(f"[FALLBACK] ({proc_name}) {host}:{port} auto-fallback to DIRECT")
+                add_dynamic_direct(host)
+                try:
+                    ch = chan_outbound_retry(host, port)
+                    use_proxy = False
+                except Exception as e2:
+                    try:
+                        client.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
+                    except Exception:
+                        pass
+                    raise e2
+        else:
+            try:
+                ch = chan_outbound_retry(host, port)
+            except Exception as e:
+                core_log(f"[FAIL] ({proc_name}) {host}:{port} direct connect failed: {e}")
+                try:
+                    client.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
+                except Exception:
+                    pass
+                raise e
+
         # 回复成功
         client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
 
-        use_proxy, node_name = decide_route(host, port)
-        log_conn("TCP", client_ip, host, port, use_proxy, node_name)
-
-        if use_proxy and g_cfg.node_count > 0:
-            ch = node_open(host, port, node_name)
-        else:
-            ch = chan_outbound(host, port)
-
-        relay_tunnel(client, ch)
+        bytes_up, bytes_down, err = relay_tunnel(client, ch)
         ch.close()
+        _report_relay_result(proc_name, host, port, use_proxy, bytes_up, bytes_down, err)
     except Exception as e:
         core_log(f"[x] SOCKS5 error: {e}")
     finally:
@@ -658,7 +1122,7 @@ def handle_socks5(client: socket.socket, client_ip: str):
 
 
 # ---- HTTP 代理处理 ----
-def handle_http(client: socket.socket, client_ip: str, first_byte: bytes):
+def handle_http(client: socket.socket, client_ip: str, first_byte: bytes, client_port: int = 0):
     """处理 HTTP 代理请求"""
     try:
         # 读取请求头
@@ -685,6 +1149,9 @@ def handle_http(client: socket.socket, client_ip: str, first_byte: bytes):
         method = parts[0].upper()
         target = parts[1]
 
+        tun_proc = get_tun_client_process(client_port) if client_port else ""
+        proc_name = tun_proc or (get_process_for_port(client_port) if client_port else "")
+
         if method == "CONNECT":
             # HTTPS 隧道
             if ":" in target:
@@ -697,18 +1164,46 @@ def handle_http(client: socket.socket, client_ip: str, first_byte: bytes):
                 host = target
                 port = 443
 
-            client.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            use_proxy, node_name = decide_route(host, port, proc_name)
+            log_conn("TCP", client_ip, client_port, host, port, use_proxy, node_name, proc_name)
 
-            use_proxy, node_name = decide_route(host, port)
-            log_conn("TCP", client_ip, host, port, use_proxy, node_name)
-
+            ch = None
             if use_proxy and g_cfg.node_count > 0:
-                ch = node_open(host, port, node_name)
+                try:
+                    ch = node_open_retry(host, port, node_name)
+                except Exception as e:
+                    core_log(f"[FAIL] ({proc_name}) {host}:{port} proxy connect failed: {e}")
+                    core_log(f"[FALLBACK] ({proc_name}) {host}:{port} auto-fallback to DIRECT")
+                    add_dynamic_direct(host)
+                    try:
+                        ch = chan_outbound_retry(host, port)
+                        use_proxy = False
+                    except Exception as e2:
+                        try:
+                            client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                        except Exception:
+                            pass
+                        raise e2
             else:
-                ch = chan_outbound(host, port)
+                try:
+                    ch = chan_outbound_retry(host, port)
+                except Exception as e:
+                    core_log(f"[FAIL] ({proc_name}) {host}:{port} direct connect failed: {e}")
+                    try:
+                        client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                    except Exception:
+                        pass
+                    raise e
 
-            relay_tunnel(client, ch)
+            try:
+                client.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            except Exception:
+                ch.close()
+                return
+
+            bytes_up, bytes_down, err = relay_tunnel(client, ch)
             ch.close()
+            _report_relay_result(proc_name, host, port, use_proxy, bytes_up, bytes_down, err)
         else:
             # 普通 HTTP
             host, port, path = parse_http_target(target, head)
@@ -717,28 +1212,44 @@ def handle_http(client: socket.socket, client_ip: str, first_byte: bytes):
                 client.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
                 return
 
-            use_proxy, node_name = decide_route(host, port)
-            log_conn(method, client_ip, host, port, use_proxy, node_name)
+            use_proxy, node_name = decide_route(host, port, proc_name)
+            log_conn(method, client_ip, client_port, host, port, use_proxy, node_name, proc_name)
 
+            ch = None
             if use_proxy and g_cfg.node_count > 0:
-                ch = node_open(host, port, node_name)
+                try:
+                    ch = node_open_retry(host, port, node_name)
+                except Exception as e:
+                    core_log(f"[FAIL] ({proc_name}) {host}:{port} proxy connect failed: {e}")
+                    core_log(f"[FALLBACK] ({proc_name}) {host}:{port} auto-fallback to DIRECT")
+                    add_dynamic_direct(host)
+                    try:
+                        ch = chan_outbound_retry(host, port)
+                        use_proxy = False
+                    except Exception as e2:
+                        client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                        return
             else:
-                ch = chan_outbound(host, port)
+                try:
+                    ch = chan_outbound_retry(host, port)
+                except Exception as e:
+                    core_log(f"[FAIL] ({proc_name}) {host}:{port} direct connect failed: {e}")
+                    client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                    return
 
             # 重写请求行
             body_start = buf[header_end:]
-            if method == "GET":
-                # 对于 GET 请求，重写为 origin-form
+            if method in ("GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"):
                 new_line = f"{method} {path} HTTP/1.1\r\n".encode()
                 rest = head.split("\r\n", 1)[1] if "\r\n" in head else ""
                 new_head = new_line + rest.encode("utf-8", errors="replace")
                 ch.send(new_head + body_start)
             else:
-                # 其他方法，转发原始请求
                 ch.send(buf[:header_end] + body_start)
 
-            relay_tunnel(client, ch)
+            bytes_up, bytes_down, err = relay_tunnel(client, ch)
             ch.close()
+            _report_relay_result(proc_name, host, port, use_proxy, bytes_up, bytes_down, err)
     except Exception as e:
         core_log(f"[x] HTTP error: {e}")
     finally:
@@ -781,16 +1292,18 @@ def parse_http_target(target: str, head: str) -> tuple:
     return host, port, path
 
 
-def log_conn(proto: str, client_ip: str, host: str, port: int, use_proxy: bool, node_name: str = None):
+def log_conn(proto: str, client_ip: str, client_port: int, host: str, port: int, use_proxy: bool, node_name: str = None, proc_name: str = None):
     """记录连接日志"""
+    proc_str = f"({proc_name})" if proc_name else ""
+    src_str = f"{client_ip}:{client_port}{proc_str}" if client_port else f"{client_ip}{proc_str}"
     if use_proxy and node_name:
-        core_log(f"[{proto}] {client_ip} --> {host}:{port} match proxy using {node_name}")
+        core_log(f"[{proto}] {src_str} --> {host}:{port} match proxy using {node_name}")
     else:
-        core_log(f"[{proto}] {client_ip} --> {host}:{port} match DIRECT using DIRECT")
+        core_log(f"[{proto}] {src_str} --> {host}:{port} match DIRECT using DIRECT")
 
 
 # ---- 客户端线程 ----
-def handle_client(client: socket.socket, client_ip: str):
+def handle_client(client: socket.socket, client_ip: str, client_port: int = 0):
     """处理客户端连接"""
     try:
         client.settimeout(HANDSHAKE_TIMEOUT)
@@ -799,9 +1312,9 @@ def handle_client(client: socket.socket, client_ip: str):
             return
 
         if first[0] == 0x05:
-            handle_socks5(client, client_ip)
+            handle_socks5(client, client_ip, client_port)
         else:
-            handle_http(client, client_ip, first)
+            handle_http(client, client_ip, first, client_port)
     except Exception as e:
         core_log(f"[x] client error: {e}")
     finally:
@@ -950,7 +1463,24 @@ def handle_controller(client: socket.socket):
         elif method == "GET" and path == "/proxies":
             ctrl_handle_proxies(client)
         elif method == "PUT" and path.startswith("/configs"):
-            ctrl_send(client, "204 No Content", "application/json", "")
+            conf_path = g_config_file
+            body = req.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in req else ""
+            if body.strip():
+                try:
+                    cdata = json.loads(body)
+                    if isinstance(cdata, dict) and cdata.get("path"):
+                        conf_path = cdata["path"]
+                except Exception:
+                    pass
+            if not conf_path and g_data_dir:
+                conf_path = os.path.join(g_data_dir, "core.conf")
+            if conf_path and os.path.exists(conf_path) and load_config(conf_path):
+                core_log(f"[i] configuration reloaded successfully from {conf_path}")
+                ctrl_send(client, "204 No Content", "application/json", "")
+            else:
+                core_log(f"[x] configuration reload failed (path={conf_path})")
+                ctrl_send(client, "500 Internal Server Error", "application/json",
+                          json.dumps({"error": "failed to reload config"}))
         elif method == "PUT" and path.startswith("/proxies/"):
             # 解析 body 中的 {"name": "..."}
             body = req.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in req else ""
@@ -980,9 +1510,14 @@ def handle_controller(client: socket.socket):
 # ---- 主流程 ----
 def aether_core_main(data_dir: str = None, config_file: str = None):
     """启动代理核心"""
-    global g_running
+    global g_running, g_data_dir, g_config_file
     CORE_STOP_EVENT.clear()
     g_running = True
+
+    if data_dir:
+        g_data_dir = data_dir
+    elif config_file:
+        g_data_dir = os.path.dirname(config_file)
 
     if config_file is None:
         if data_dir:
@@ -1040,7 +1575,8 @@ def aether_core_main(data_dir: str = None, config_file: str = None):
             try:
                 client, addr = proxy_sock.accept()
                 client_ip = addr[0]
-                threading.Thread(target=handle_client, args=(client, client_ip), daemon=True).start()
+                client_port = addr[1] if len(addr) > 1 else 0
+                threading.Thread(target=handle_client, args=(client, client_ip, client_port), daemon=True).start()
             except socket.timeout:
                 continue
             except Exception:
