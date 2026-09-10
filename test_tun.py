@@ -91,9 +91,15 @@ ans_ip = socket.inet_ntoa(resp[-4:])
 check("A record = fake ip", ans_ip == dns.pool.get_v4("example.com"), ans_ip)
 
 query6 = struct.pack(">HHHHHH", 0x5678, 0x0100, 1, 0, 0, 0) + qname + struct.pack(">HH", 28, 1)
-resp6 = dns.handle_query(query6)
+# 1) 无 IPv6 上行时返回空应答 (0 answers)，防止 IPv6 直连挂起
+resp6_no_v6 = dns.handle_query(query6)
+check("AAAA empty NOERROR when no v6", resp6_no_v6 is not None and len(resp6_no_v6) == 12 + len(qname) + 4)
+
+# 2) 有 IPv6 上行时返回 Fake-IP IPv6
+dns_v6 = td.FakeIPDNS(bind_ip="10.0.0.2", bind_ip6="2001:db8::1")
+resp6 = dns_v6.handle_query(query6)
 rdlen6 = struct.unpack(">H", resp6[-18:-16])[0] if resp6 else 0
-check("AAAA answered", resp6 is not None and len(resp6) > len(query6))
+check("AAAA answered with v6", resp6 is not None and len(resp6) > len(query6))
 check("AAAA rdata 16B", rdlen6 == 16 and len(resp6[-16:]) == 16, str(rdlen6))
 
 # HTTPS(65) 空应答
@@ -321,7 +327,8 @@ except Exception as e:
     check("controller put status", False, str(e))
 
 # 验证热重载后生效: git.exe 变成了 DIRECT
-check("hot-reload route changed", route_target("example.com", proc="git.exe") == "DIRECT")
+time.sleep(0.1)
+check("hot-reload route changed", route_target("example.com", proc="git.exe") == "DIRECT", f"got {route_target('example.com', proc='git.exe')}")
 ctrl_server.shutdown()
 
 # ---- 12. TUN 底层 Ctypes 内存布局与物理网卡探测 ----
@@ -346,6 +353,82 @@ check("sockaddr_inet_v6 addr", raw6[8:24] == socket.inet_pton(socket.AF_INET6, "
 check("unicast row address at offset 0", at.MIB_UNICASTIPADDRESS_ROW.Address.offset == 0)
 fwd_row = at.MIB_IPFORWARDROW()
 check("ipforwardrow has named fields", hasattr(fwd_row, "dwForwardNextHop") and hasattr(fwd_row, "dwForwardIfIndex"))
+
+# ---- 13. SOCKS5 入站服务端握手与连通测试 ----
+print("== socks5 server inbound handshake ==")
+# 目标 echo 服务
+echo_s = socket.socket()
+echo_s.bind(("127.0.0.1", 0))
+echo_s.listen(1)
+echo_p = echo_s.getsockname()[1]
+
+def _echo_runner():
+    try:
+        conn, _ = echo_s.accept()
+        data = conn.recv(1024)
+        conn.sendall(data)
+        conn.close()
+    except Exception:
+        pass
+
+threading.Thread(target=_echo_runner, daemon=True).start()
+
+# AetherCore handle_client 服务端
+core_s = socket.socket()
+core_s.bind(("127.0.0.1", 0))
+core_s.listen(2)
+core_p = core_s.getsockname()[1]
+
+def _core_runner():
+    try:
+        conn, addr = core_s.accept()
+        ac.handle_client(conn, addr[0], addr[1])
+    except Exception:
+        pass
+
+threading.Thread(target=_core_runner, daemon=True).start()
+
+try:
+    c_sock = tt.socks5_connect(("127.0.0.1", core_p), "127.0.0.1", echo_p, timeout=2.0)
+    check("socks5 handshake success", c_sock is not None)
+    c_sock.sendall(b"hello-socks5")
+    echo_resp = c_sock.recv(1024)
+    check("socks5 relay data", echo_resp == b"hello-socks5")
+    c_sock.close()
+except Exception as e:
+    check("socks5 handshake success", False, str(e))
+    check("socks5 relay data", False, str(e))
+finally:
+    core_s.close()
+    echo_s.close()
+
+# ---- 15. clean_host & dynamic direct 防污染测试 ----
+print("== clean_host & anti-poisoning ==")
+check("clean_host domain", ac.clean_host("google.com:443") == "google.com")
+check("clean_host bracketed v6", ac.clean_host("[2001:4860::1]:443") == "2001:4860::1")
+check("clean_host raw v6", ac.clean_host("2001:4860:4846:400::") == "2001:4860:4846:400::")
+check("clean_host ipv4", ac.clean_host("1.2.3.4:80") == "1.2.3.4")
+
+# 测试防污染: IP 地址不应被写入直连白名单
+ac.g_dynamic_direct.clear()
+ac.add_dynamic_direct("2001:4860:4846:400::")
+ac.add_dynamic_direct("142.250.190.46")
+check("dynamic direct rejects raw v6", "2001:4860:4846:400::" not in ac.g_dynamic_direct)
+check("dynamic direct rejects raw v4", "142.250.190.46" not in ac.g_dynamic_direct)
+
+ac.add_dynamic_direct("example.cn")
+check("dynamic direct accepts domestic domain", "example.cn" in ac.g_dynamic_direct)
+
+# 测试 TUN 模式下无 IPv6 出口时 dial_host 立即抛出网络不可达
+os.environ["AETHER_TUN"] = "1"
+os.environ.pop("AETHER_BIND_IP6", None)
+try:
+    ac.dial_host("2001:4860:4846:400::", 443, timeout=0.1)
+    check("dial_host v6 without uplink raises immediately", False, "no exception raised")
+except OSError as e:
+    check("dial_host v6 without uplink raises immediately", "unreachable" in str(e).lower())
+finally:
+    os.environ.pop("AETHER_TUN", None)
 
 print()
 print(f"RESULT: {PASS} passed, {FAIL} failed")

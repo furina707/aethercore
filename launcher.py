@@ -35,27 +35,46 @@ import msvcrt
 from ctypes import wintypes
 
 def get_process_for_port(port: int) -> str:
-    """Windows 获取指定本地 TCP 端口的进程名"""
+    """Windows 获取指定本地 TCP 端口的进程名 (支持 IPv4 与 IPv6)"""
     if sys.platform != "win32" or port <= 0:
         return "App"
     try:
         TCP_TABLE_OWNER_PID_ALL = 5
         AF_INET = 2
+        AF_INET6 = 23
+        pid = 0
+
+        # 1. 优先查 IPv4 TCP 表
         size = wintypes.DWORD(0)
         ctypes.windll.iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0)
-        buf = ctypes.create_string_buffer(size.value)
-        if ctypes.windll.iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != 0:
-            return "App"
-        num = struct.unpack_from("I", buf, 0)[0]
-        offset = 4
-        pid = 0
-        for _ in range(num):
-            state, laddr, lport, raddr, rport, owning_pid = struct.unpack_from("6I", buf, offset)
-            net_port = socket.ntohs(lport & 0xFFFF)
-            if net_port == port:
-                pid = owning_pid
-                break
-            offset += 24
+        if size.value > 0:
+            buf = ctypes.create_string_buffer(size.value)
+            if ctypes.windll.iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == 0:
+                num = struct.unpack_from("I", buf, 0)[0]
+                offset = 4
+                for _ in range(num):
+                    state, laddr, lport, raddr, rport, owning_pid = struct.unpack_from("6I", buf, offset)
+                    if socket.ntohs(lport & 0xFFFF) == port:
+                        pid = owning_pid
+                        break
+                    offset += 24
+
+        # 2. 若 IPv4 未查到，查询 IPv6 TCP 表 (MIB_TCP6ROW_OWNER_PID, 56 字节/项)
+        if pid <= 0:
+            size = wintypes.DWORD(0)
+            ctypes.windll.iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0)
+            if size.value > 0:
+                buf = ctypes.create_string_buffer(size.value)
+                if ctypes.windll.iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size), False, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) == 0:
+                    num = struct.unpack_from("I", buf, 0)[0]
+                    offset = 4
+                    for _ in range(num):
+                        lport = struct.unpack_from("I", buf, offset + 20)[0]
+                        if socket.ntohs(lport & 0xFFFF) == port:
+                            pid = struct.unpack_from("I", buf, offset + 52)[0]
+                            break
+                        offset += 56
+
         if pid <= 0:
             return "App"
 
@@ -254,7 +273,12 @@ def elevate_admin():
 def kill_conflicting_proxies():
     try:
         subprocess.run(["powershell", "-Command",
-            "Get-Process -Name 'clash-verge', 'verge-mihomo', 'clash' -ErrorAction SilentlyContinue | Stop-Process -Force"],
+            "Get-Process -Name '*clash*', '*mihomo*', '*verge*', 'sing-box*', 'xray*', 'v2ray*' -ErrorAction SilentlyContinue | Stop-Process -Force"],
+            capture_output=True)
+    except Exception:
+        pass
+    try:
+        subprocess.run(["taskkill", "/F", "/IM", "clash-verge.exe", "/IM", "verge-mihomo.exe", "/IM", "verge-mihomo-alpha.exe", "/IM", "clash.exe", "/IM", "mihomo.exe", "/IM", "sing-box.exe"],
             capture_output=True)
     except Exception:
         pass
@@ -453,6 +477,11 @@ def start_tun_engine():
     host, port = parse_listen_addr(CORE_CONF)
 
     def tun_log(msg):
+        try:
+            import core.aether_core as ac
+            ac.core_log(f"{msg}")
+        except Exception:
+            pass
         print(f"{Color.CYAN}{msg}{Color.RESET}", flush=True)
 
     eng = TunEngine(socks_addr=(host, port), conf_path=CORE_CONF, log=tun_log)
@@ -1272,7 +1301,19 @@ def _build_header_card(width: int, height: int, active_tab: int, up: int, down: 
     s_node = f" 节点: {node_disp} " if width < 90 else f" 节点: {node_disp} ({node_count}个) "
     s_up = f" 上行: {format_bytes(up_spd)}/s " if width < 90 else f" 上行: {format_bytes(up_spd)}/s ({format_bytes(up)}) "
     s_down = f" 下行: {format_bytes(down_spd)}/s " if width < 90 else f" 下行: {format_bytes(down_spd)}/s ({format_bytes(down)}) "
-    s_mode = " 模式: 全量代理 "
+    if _TUN_MODE["active"]:
+        s_mode = " 模式: TUN全局接管 "
+        c_mode = colors.GREEN + colors.BOLD
+    elif _TUN_MODE.get("error"):
+        err_b = _truncate(_TUN_MODE["error"], 16)
+        s_mode = f" 模式: TUN异常({err_b}) "
+        c_mode = colors.RED + colors.BOLD
+    elif not parse_tun_enabled(CORE_CONF):
+        s_mode = " 模式: 仅内核代理 "
+        c_mode = colors.YELLOW
+    else:
+        s_mode = " 模式: 全量代理 "
+        c_mode = colors.YELLOW
 
     div = "│"
     w_content = _disp_width(s_node) + 1 + _disp_width(s_up) + 1 + _disp_width(s_down)
@@ -1295,7 +1336,7 @@ def _build_header_card(width: int, height: int, active_tab: int, up: int, down: 
     if include_mode:
         row2.extend([
             (div, colors.GRAY),
-            (s_mode, colors.YELLOW),
+            (s_mode, c_mode),
         ])
     row2.extend([
         (" " * rem_spaces, ""),
@@ -2301,15 +2342,33 @@ def main():
     if parse_tun_enabled(CORE_CONF):
         host, port = parse_listen_addr(CORE_CONF)
         if not wait_core_listen(host, port):
-            print(f"{Color.RED}[x] 内核入站 ({host}:{port}) 未就绪，无法启动 TUN 引擎{Color.RESET}")
+            err_msg = f"[x] 内核监听 ({host}:{port}) 未就绪，无法启动 TUN"
+            try:
+                import core.aether_core as ac
+                ac.core_log(f"[tun] {err_msg}")
+            except Exception:
+                pass
+            print(f"{Color.RED}{err_msg}{Color.RESET}")
         else:
             try:
                 start_tun_engine()
                 _TUN_MODE["active"] = True
-                print(f"{Color.GREEN}[ok] TUN 全局接管已开启 (IPv4+IPv6, Fake-IP DNS){Color.RESET}")
+                msg = "[ok] TUN 全局接管已开启 (IPv4+IPv6, Fake-IP DNS)"
+                try:
+                    import core.aether_core as ac
+                    ac.core_log(f"[tun] {msg}")
+                except Exception:
+                    pass
+                print(f"{Color.GREEN}{msg}{Color.RESET}")
             except Exception as e:
                 _TUN_MODE["error"] = str(e)
-                print(f"{Color.RED}[x] TUN 模式启动失败: {e}{Color.RESET}")
+                err_msg = f"[x] TUN 模式启动失败: {e}"
+                try:
+                    import core.aether_core as ac
+                    ac.core_log(f"[tun] {err_msg}")
+                except Exception:
+                    pass
+                print(f"{Color.RED}{err_msg}{Color.RESET}")
     else:
         print(f"{Color.YELLOW}[!] TUN 模式已在 core.conf 中关闭 (tun off){Color.RESET}")
 
@@ -2338,7 +2397,14 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        print(f"\n{Color.RED}[x] 未捕获异常: {e}{Color.RESET}")
         import traceback
+        tb = traceback.format_exc()
+        try:
+            core_log_path = os.path.join(DATA_DIR, "core.log")
+            with open(core_log_path, "a", encoding="utf-8", errors="ignore") as f:
+                f.write(f"\n[CRASH] Launcher unhandled exception:\n{tb}\n")
+        except Exception:
+            pass
+        print(f"\n{Color.RED}[x] 未捕获异常: {e}{Color.RESET}")
         traceback.print_exc()
-        input("\n按回车键退出...")
+        input("\n按回车退出...")

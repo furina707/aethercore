@@ -45,100 +45,12 @@ class GUID(ctypes.Structure):
     ]
 
 
-# WINTUN_CREATE_ADAPTER_FUNC
-WINTUN_CREATE_ADAPTER_FUNC = ctypes.WINFUNCTYPE(
-    WINTUN_ADAPTER_HANDLE,
-    wintypes.LPCWSTR,       # Name
-    wintypes.LPCWSTR,       # TunnelType
-    ctypes.POINTER(GUID),   # RequestedGUID (optional)
-)
-
-# WINTUN_OPEN_ADAPTER_FUNC
-WINTUN_OPEN_ADAPTER_FUNC = ctypes.WINFUNCTYPE(
-    WINTUN_ADAPTER_HANDLE,
-    wintypes.LPCWSTR,       # Name
-)
-
-# WINTUN_CLOSE_ADAPTER_FUNC
-WINTUN_CLOSE_ADAPTER_FUNC = ctypes.WINFUNCTYPE(
-    None,
-    WINTUN_ADAPTER_HANDLE,  # Adapter
-)
-
-# WINTUN_DELETE_DRIVER_FUNC
-WINTUN_DELETE_DRIVER_FUNC = ctypes.WINFUNCTYPE(
-    wintypes.BOOL,
-)
-
-# WINTUN_GET_ADAPTER_LUID_FUNC
-WINTUN_GET_ADAPTER_LUID_FUNC = ctypes.WINFUNCTYPE(
-    None,
-    WINTUN_ADAPTER_HANDLE,  # Adapter
-    ctypes.c_void_p,        # Luid (NET_LUID*)
-)
-
-# WINTUN_GET_RUNNING_DRIVER_VERSION_FUNC
-WINTUN_GET_RUNNING_DRIVER_VERSION_FUNC = ctypes.WINFUNCTYPE(
-    wintypes.DWORD,
-)
-
 # WINTUN_SET_LOGGER_FUNC
 WINTUN_LOGGER_CALLBACK = ctypes.WINFUNCTYPE(
     None,
     wintypes.DWORD,         # Level
     wintypes.DWORD64,       # Timestamp
     wintypes.LPCWSTR,       # Message
-)
-WINTUN_SET_LOGGER_FUNC = ctypes.WINFUNCTYPE(
-    None,
-    WINTUN_LOGGER_CALLBACK, # NewLogger
-)
-
-# WINTUN_START_SESSION_FUNC
-WINTUN_START_SESSION_FUNC = ctypes.WINFUNCTYPE(
-    WINTUN_SESSION_HANDLE,
-    WINTUN_ADAPTER_HANDLE,  # Adapter
-    wintypes.DWORD,         # Capacity
-)
-
-# WINTUN_END_SESSION_FUNC
-WINTUN_END_SESSION_FUNC = ctypes.WINFUNCTYPE(
-    None,
-    WINTUN_SESSION_HANDLE,  # Session
-)
-
-# WINTUN_GET_READ_WAIT_EVENT_FUNC
-WINTUN_GET_READ_WAIT_EVENT_FUNC = ctypes.WINFUNCTYPE(
-    wintypes.HANDLE,
-    WINTUN_SESSION_HANDLE,  # Session
-)
-
-# WINTUN_RECEIVE_PACKET_FUNC
-WINTUN_RECEIVE_PACKET_FUNC = ctypes.WINFUNCTYPE(
-    ctypes.c_void_p,                # BYTE* -> c_void_p
-    WINTUN_SESSION_HANDLE,          # Session
-    ctypes.POINTER(wintypes.DWORD), # PacketSize
-)
-
-# WINTUN_RELEASE_RECEIVE_PACKET_FUNC
-WINTUN_RELEASE_RECEIVE_PACKET_FUNC = ctypes.WINFUNCTYPE(
-    None,
-    WINTUN_SESSION_HANDLE,          # Session
-    ctypes.c_void_p,                # Packet
-)
-
-# WINTUN_ALLOCATE_SEND_PACKET_FUNC
-WINTUN_ALLOCATE_SEND_PACKET_FUNC = ctypes.WINFUNCTYPE(
-    ctypes.c_void_p,                # BYTE* -> c_void_p
-    WINTUN_SESSION_HANDLE,          # Session
-    wintypes.DWORD,                 # PacketSize
-)
-
-# WINTUN_SEND_PACKET_FUNC
-WINTUN_SEND_PACKET_FUNC = ctypes.WINFUNCTYPE(
-    None,
-    WINTUN_SESSION_HANDLE,          # Session
-    ctypes.c_void_p,                # Packet
 )
 
 WINTUN_MAX_IP_PACKET_SIZE = 0xFFFF
@@ -180,7 +92,6 @@ class WintunEngine:
 
     def __init__(self):
         self._module = None
-        self._fns = {}
         self._logger_cb = None
 
     def load(self, dll_path=None):
@@ -204,48 +115,52 @@ class WintunEngine:
         if not self._module:
             return False
 
-        # 解析所有函数
-        fn_names = [
-            "WintunCreateAdapter",
-            "WintunCloseAdapter",
-            "WintunOpenAdapter",
-            "WintunGetAdapterLUID",
-            "WintunGetRunningDriverVersion",
-            "WintunDeleteDriver",
-            "WintunSetLogger",
-            "WintunStartSession",
-            "WintunEndSession",
-            "WintunGetReadWaitEvent",
-            "WintunReceivePacket",
-            "WintunReleaseReceivePacket",
-            "WintunAllocateSendPacket",
-            "WintunSendPacket",
-        ]
+        mod = self._module
+        try:
+            mod.WintunCreateAdapter.restype = ctypes.c_void_p
+            mod.WintunCreateAdapter.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(GUID)]
 
-        fn_types = {
-            "WintunCreateAdapter": WINTUN_CREATE_ADAPTER_FUNC,
-            "WintunCloseAdapter": WINTUN_CLOSE_ADAPTER_FUNC,
-            "WintunOpenAdapter": WINTUN_OPEN_ADAPTER_FUNC,
-            "WintunGetAdapterLUID": WINTUN_GET_ADAPTER_LUID_FUNC,
-            "WintunGetRunningDriverVersion": WINTUN_GET_RUNNING_DRIVER_VERSION_FUNC,
-            "WintunDeleteDriver": WINTUN_DELETE_DRIVER_FUNC,
-            "WintunSetLogger": WINTUN_SET_LOGGER_FUNC,
-            "WintunStartSession": WINTUN_START_SESSION_FUNC,
-            "WintunEndSession": WINTUN_END_SESSION_FUNC,
-            "WintunGetReadWaitEvent": WINTUN_GET_READ_WAIT_EVENT_FUNC,
-            "WintunReceivePacket": WINTUN_RECEIVE_PACKET_FUNC,
-            "WintunReleaseReceivePacket": WINTUN_RELEASE_RECEIVE_PACKET_FUNC,
-            "WintunAllocateSendPacket": WINTUN_ALLOCATE_SEND_PACKET_FUNC,
-            "WintunSendPacket": WINTUN_SEND_PACKET_FUNC,
-        }
+            mod.WintunCloseAdapter.restype = None
+            mod.WintunCloseAdapter.argtypes = [ctypes.c_void_p]
 
-        for name in fn_names:
-            try:
-                fn_ptr = self._module[name]
-                self._fns[name] = fn_types[name](fn_ptr)
-            except AttributeError:
-                self._module = None
-                return False
+            mod.WintunOpenAdapter.restype = ctypes.c_void_p
+            mod.WintunOpenAdapter.argtypes = [wintypes.LPCWSTR]
+
+            mod.WintunGetAdapterLUID.restype = None
+            mod.WintunGetAdapterLUID.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+            mod.WintunGetRunningDriverVersion.restype = wintypes.DWORD
+            mod.WintunGetRunningDriverVersion.argtypes = []
+
+            mod.WintunDeleteDriver.restype = wintypes.BOOL
+            mod.WintunDeleteDriver.argtypes = []
+
+            mod.WintunSetLogger.restype = None
+            mod.WintunSetLogger.argtypes = [WINTUN_LOGGER_CALLBACK]
+
+            mod.WintunStartSession.restype = ctypes.c_void_p
+            mod.WintunStartSession.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+
+            mod.WintunEndSession.restype = None
+            mod.WintunEndSession.argtypes = [ctypes.c_void_p]
+
+            mod.WintunGetReadWaitEvent.restype = wintypes.HANDLE
+            mod.WintunGetReadWaitEvent.argtypes = [ctypes.c_void_p]
+
+            mod.WintunReceivePacket.restype = ctypes.c_void_p
+            mod.WintunReceivePacket.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+
+            mod.WintunReleaseReceivePacket.restype = None
+            mod.WintunReleaseReceivePacket.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+            mod.WintunAllocateSendPacket.restype = ctypes.c_void_p
+            mod.WintunAllocateSendPacket.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+
+            mod.WintunSendPacket.restype = None
+            mod.WintunSendPacket.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        except AttributeError:
+            self._module = None
+            return False
 
         # 设置默认日志回调
         self._set_default_logger()
@@ -259,17 +174,16 @@ class WintunEngine:
             print(f"[Wintun] {prefix}: {message}", file=sys.stderr)
 
         self._logger_cb = _log_cb
-        self._fns["WintunSetLogger"](_log_cb)
+        self._module.WintunSetLogger(_log_cb)
 
     def __getattr__(self, name):
-        if name.startswith("_") or name not in self._fns:
-            raise AttributeError(f"WintunEngine has no attribute {name}")
-        return self._fns[name]
+        if self._module and hasattr(self._module, name):
+            return getattr(self._module, name)
+        raise AttributeError(f"WintunEngine has no attribute {name}")
 
     def unload(self):
         if self._module:
             self._module = None
-            self._fns = {}
             self._logger_cb = None
 
 
@@ -568,7 +482,6 @@ class _IPHLPAPI:
         if not self._ensure_loaded():
             return False, None
         row = MIB_IPFORWARD_ROW2()
-        self._dll.InitializeIpForwardEntry2(ctypes.byref(row))
         row.InterfaceLuid = luid
         if if_index:
             row.InterfaceIndex = if_index
@@ -583,7 +496,15 @@ class _IPHLPAPI:
         row.DestinationPrefix.PrefixLength = prefix_len
         row.Metric = metric
         row.Protocol = 3  # MIB_IPPROTO_NETMGMT
+        row.ValidLifetime = 0xFFFFFFFF
+        row.PreferredLifetime = 0xFFFFFFFF
         res = self._dll.CreateIpForwardEntry2(ctypes.byref(row))
+        if res != 0 and res != 0x000000B7 and gw_str:
+            if ':' in dest_str:
+                row.NextHop = sockaddr_inet_v6('::')
+            else:
+                row.NextHop = sockaddr_inet_v4('0.0.0.0')
+            res = self._dll.CreateIpForwardEntry2(ctypes.byref(row))
         return res == 0 or res == 0x000000B7, row
 
     def delete_route(self, row):
@@ -758,31 +679,60 @@ class WintunDevice:
         self._send_lock = threading.Lock()
 
     def open(self, engine=None):
-        """创建 WinTUN 虚拟网卡 (若存在同名残留网卡先冲销，避免残留路由悬挂)"""
         eng = engine or _g_engine
         if not eng.load():
-            raise RuntimeError("无法加载 wintun.dll，请确保 wintun.dll 位于当前目录或系统目录")
+            raise RuntimeError('无法加载 wintun.dll，请确保 wintun.dll 位于当前目录或系统目录')
 
-        # 清理上次异常退出残留的同名网卡 (残留网卡会悬挂 0.0.0.0/1 等接管路由)
-        stale = eng.WintunOpenAdapter(self.adapter_name)
-        if stale:
-            eng.WintunCloseAdapter(stale)
+        adapter = eng.WintunOpenAdapter(self.adapter_name)
+        if not adapter:
+            adapter = eng.WintunCreateAdapter(self.adapter_name, self.tunnel_type, None)
+        if not adapter:
+            time.sleep(0.3)
+            adapter = eng.WintunOpenAdapter(self.adapter_name)
+        if not adapter:
+            raise RuntimeError(f"创建或打开 Wintun 适配器 '{self.adapter_name}' 失败 (需管理员权限)")
 
-        self._adapter = eng.WintunCreateAdapter(self.adapter_name, self.tunnel_type, None)
-        if not self._adapter:
-            raise RuntimeError(f"创建 Wintun 网卡 '{self.adapter_name}' 失败 (需要管理员权限)")
+        session = None
+        try:
+            session = eng.WintunStartSession(adapter, 0x400000)
+        except Exception:
+            session = None
 
-        # 启动 4MB 环形缓冲区
-        self._session = eng.WintunStartSession(self._adapter, 0x400000)
-        if not self._session:
-            eng.WintunCloseAdapter(self._adapter)
-            self._adapter = None
-            raise RuntimeError("启动 Wintun 会话失败")
+        if not session:
+            try:
+                eng.WintunCloseAdapter(adapter)
+            except Exception:
+                pass
+            time.sleep(0.5)
+            adapter = eng.WintunCreateAdapter(self.adapter_name, self.tunnel_type, None)
+            if not adapter:
+                raise RuntimeError(f"重新创建 Wintun 适配器 '{self.adapter_name}' 失败")
+            session = eng.WintunStartSession(adapter, 0x400000)
+            if not session:
+                raise RuntimeError('启动 Wintun 会话失败')
 
+        self._adapter = adapter
+        self._session = session
         self._read_event = eng.WintunGetReadWaitEvent(self._session)
 
         self._luid = NET_LUID()
         eng.WintunGetAdapterLUID(self._adapter, ctypes.byref(self._luid))
+
+        self.interface_alias = self.adapter_name
+        self.interface_index = 0
+        try:
+            alias_buf = ctypes.create_unicode_buffer(256)
+            if _g_iphlp._ensure_loaded() and _g_iphlp._dll.ConvertInterfaceLuidToAlias(
+                ctypes.byref(self._luid), alias_buf, 256
+            ) == 0 and alias_buf.value:
+                self.interface_alias = alias_buf.value
+            idx = wintypes.DWORD()
+            if _g_iphlp._ensure_loaded() and _g_iphlp._dll.ConvertInterfaceLuidToIndex(
+                ctypes.byref(self._luid), ctypes.byref(idx)
+            ) == 0:
+                self.interface_index = idx.value
+        except Exception:
+            pass
 
         return self
 
@@ -797,28 +747,55 @@ class WintunDevice:
             iphlp.set_ip_address(self._luid, ipv6_str, str(ipv6_prefix))
 
         # 配置 TUN 网卡 DNS 服务器为 Fake-IP 网关地址，保证系统 DNS 查询进入 TUN 劫持
-        try:
-            import subprocess
-            flags = 0x08000000 if sys.platform == "win32" else 0
-            subprocess.run(
-                ["netsh", "interface", "ipv4", "set", "dnsservers",
-                 f"name={self.adapter_name}", "source=static", f"address={ip_str}",
-                 "register=none", "validate=no"],
-                capture_output=True, timeout=3, creationflags=flags
-            )
-            if ipv6_str:
-                subprocess.run(
-                    ["netsh", "interface", "ipv6", "set", "dnsservers",
-                     f"name={self.adapter_name}", "source=static", f"address={ipv6_str}",
-                     "register=none", "validate=no"],
+        targets = []
+        if getattr(self, 'interface_index', 0):
+            targets.append(str(self.interface_index))
+        if getattr(self, 'interface_alias', None):
+            targets.append(self.interface_alias)
+        if self.adapter_name:
+            targets.append(self.adapter_name)
+
+        flags = 0x08000000 if sys.platform == 'win32' else 0
+        for target_name in targets:
+            try:
+                res = subprocess.run(
+                    ['netsh', 'interface', 'ipv4', 'set', 'dnsservers',
+                     f'name={target_name}', 'source=static', f'address={ip_str}',
+                     'register=none', 'validate=no'],
                     capture_output=True, timeout=3, creationflags=flags
                 )
-        except Exception:
-            pass
+                if res.returncode == 0:
+                    break
+            except Exception:
+                pass
+
+        if ipv6_str:
+            for target_name in targets:
+                try:
+                    res = subprocess.run(
+                        ['netsh', 'interface', 'ipv6', 'set', 'dnsservers',
+                         f'name={target_name}', 'source=static', f'address={ipv6_str}',
+                         'register=none', 'validate=no'],
+                        capture_output=True, timeout=3, creationflags=flags
+                    )
+                    if res.returncode == 0:
+                        break
+                except Exception:
+                    pass
+
+        if getattr(self, 'interface_index', 0):
+            try:
+                ps_cmd = (f'Set-DnsClientServerAddress -InterfaceIndex {self.interface_index} '
+                          f"-ServerAddresses @('{ip_str}')")
+                subprocess.run(['powershell', '-Command', ps_cmd],
+                               capture_output=True, timeout=3, creationflags=flags)
+            except Exception:
+                pass
 
     def add_route(self, dest_str, prefix_len, gw_str, metric=1):
         """添加经本网卡的路由并登记 (stop 时自动清理)"""
-        ok, row = _g_iphlp.add_route(self._luid, dest_str, prefix_len, gw_str, metric)
+        if_idx = getattr(self, 'interface_index', 0)
+        ok, row = _g_iphlp.add_route(self._luid, dest_str, prefix_len, gw_str, metric, if_index=if_idx)
         if ok and row is not None:
             self._route_rows.append(row)
         return ok
@@ -831,15 +808,15 @@ class WintunDevice:
         """
         results = []
         if with_v4:
-            results.append(self.add_route("0.0.0.0", 1, TUN_V4_IP))
-            results.append(self.add_route("128.0.0.0", 1, TUN_V4_IP))
+            results.append(self.add_route("0.0.0.0", 1, None))
+            results.append(self.add_route("128.0.0.0", 1, None))
             net, plen = FAKE_V4_NET.split("/")
-            results.append(self.add_route(net, int(plen), TUN_V4_IP))
+            results.append(self.add_route(net, int(plen), None))
         if with_v6:
-            results.append(self.add_route("::", 1, TUN_V6_IP))
-            results.append(self.add_route("8000::", 1, TUN_V6_IP))
+            results.append(self.add_route("::", 1, None))
+            results.append(self.add_route("8000::", 1, None))
             net, plen = FAKE_V6_NET.split("/")
-            results.append(self.add_route(net, int(plen), TUN_V6_IP))
+            results.append(self.add_route(net, int(plen), None))
         return all(results)
 
     def install_bypass_route_v4(self, dest_ip: str):

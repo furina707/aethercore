@@ -19,6 +19,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aether_tun import (
     WintunDevice, detect_physical_network, is_fake_v4, is_fake_v6, is_fake_ip,
+    TUN_V6_IP,
 )
 from tun_dns import FakeIPDNS
 from tun_tcp import TcpStack
@@ -289,7 +290,8 @@ class TunEngine:
 
         self.device.physical = self.phys
         self.device.open()
-        self.device.configure_network()
+        has_v6 = bool(self.phys.get("v6_ip"))
+        self.device.configure_network(ipv6_str=TUN_V6_IP if has_v6 else None)
 
         # 节点服务器 /32 主机路由 (双保险: 即使绑定失效也直走物理网关)
         for server in self._node_servers():
@@ -299,11 +301,14 @@ class TunEngine:
                 except Exception:
                     pass
 
-        if not self.device.install_capture_routes(with_v4=True, with_v6=True):
+        if not self.device.install_capture_routes(with_v4=True, with_v6=has_v6):
             raise RuntimeError("接管路由安装失败")
-        self.log("[tun] 已接管 v4 (0.0.0.0/1+128.0.0.0/1) 与 v6 (::/1+8000::/1) 默认路由")
+        if has_v6:
+            self.log("[tun] 已接管 v4 (0.0.0.0/1+128.0.0.0/1) 与 v6 (::/1+8000::/1) 默认路由")
+        else:
+            self.log("[tun] 已接管 v4 (0.0.0.0/1+128.0.0.0/1) 默认路由 (物理出口无 IPv6，已跳过 v6 接管)")
 
-        self.dns = FakeIPDNS(bind_ip=self.phys["v4_ip"], bind_ip6=self.phys["v6_ip"],
+        self.dns = FakeIPDNS(bind_ip=self.phys["v4_ip"], bind_ip6=self.phys.get("v6_ip"),
                              log=self.log)
         self.tcp = TcpStack(self.device, self.dns, self.socks_addr, log=self.log)
         self.tcp.start()
@@ -391,6 +396,7 @@ class TunEngine:
                 else:
                     pkt = build_ip6_packet(dst, src, 17, seg)
                 self.device.write_packet(pkt)
+                return
         if is_fake_ip(dst):
             # 浏览器通过 Fake-IP 解析后尝试 QUIC (UDP 443)，直接丢弃促使浏览器立即回退到 TCP HTTPS
             return

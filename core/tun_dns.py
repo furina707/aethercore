@@ -196,6 +196,10 @@ class FakeIPDNS:
             return _build_response(txid, qname, qtype,
                                    [(1, 60, socket.inet_aton(self.pool.get_v4(lname)))])
         if qtype == QTYPES["AAAA"]:
+            if not self.bind_ip6:
+                # 物理网络无 IPv6 出口，直接返回空应答 (NOERROR, 0 answers)
+                # 促使客户端/浏览器/Antigravity 立即使用 IPv4 Fake-IP，彻底避免 IPv6 直连超时
+                return _build_response(txid, qname, qtype, [])
             fake6 = self.pool.get_v6(lname)
             return _build_response(txid, qname, qtype,
                                    [(28, 60, socket.inet_pton(socket.AF_INET6, fake6))])

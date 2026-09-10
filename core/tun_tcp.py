@@ -161,7 +161,10 @@ def socks5_connect(socks_addr, dest, port, timeout=10.0, client_port: int = 0):
     # 登记 TUN 模式原客户端的真实进程名，使内核分应用规则和日志能准确关联
     if client_port:
         try:
-            import aether_core
+            try:
+                import core.aether_core as aether_core
+            except ImportError:
+                import aether_core
             real_proc = aether_core.get_process_for_port(client_port)
             if real_proc and real_proc != "App":
                 aether_core.register_tun_client_port(s.getsockname()[1], real_proc)

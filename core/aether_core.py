@@ -156,7 +156,7 @@ def core_log(fmt: str, *args):
 
 
 def get_process_for_port(port: int) -> str:
-    """Windows 获取指定本地 TCP 端口的进程名"""
+    """Windows 获取指定本地 TCP 端口的进程名 (支持 IPv4 与 IPv6)"""
     if sys.platform != "win32" or port <= 0:
         return "App"
     try:
@@ -164,21 +164,40 @@ def get_process_for_port(port: int) -> str:
         from ctypes import wintypes
         TCP_TABLE_OWNER_PID_ALL = 5
         AF_INET = 2
+        AF_INET6 = 23
+        pid = 0
+
+        # 1. 优先查 IPv4 TCP 表
         size = wintypes.DWORD(0)
         ctypes.windll.iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0)
-        buf = ctypes.create_string_buffer(size.value)
-        if ctypes.windll.iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != 0:
-            return "App"
-        num = struct.unpack_from("I", buf, 0)[0]
-        offset = 4
-        pid = 0
-        for _ in range(num):
-            state, laddr, lport, raddr, rport, owning_pid = struct.unpack_from("6I", buf, offset)
-            net_port = socket.ntohs(lport & 0xFFFF)
-            if net_port == port:
-                pid = owning_pid
-                break
-            offset += 24
+        if size.value > 0:
+            buf = ctypes.create_string_buffer(size.value)
+            if ctypes.windll.iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size), False, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == 0:
+                num = struct.unpack_from("I", buf, 0)[0]
+                offset = 4
+                for _ in range(num):
+                    state, laddr, lport, raddr, rport, owning_pid = struct.unpack_from("6I", buf, offset)
+                    if socket.ntohs(lport & 0xFFFF) == port:
+                        pid = owning_pid
+                        break
+                    offset += 24
+
+        # 2. 若 IPv4 未查到，查询 IPv6 TCP 表 (MIB_TCP6ROW_OWNER_PID, 56 字节/项)
+        if pid <= 0:
+            size = wintypes.DWORD(0)
+            ctypes.windll.iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0)
+            if size.value > 0:
+                buf = ctypes.create_string_buffer(size.value)
+                if ctypes.windll.iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size), False, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) == 0:
+                    num = struct.unpack_from("I", buf, 0)[0]
+                    offset = 4
+                    for _ in range(num):
+                        lport = struct.unpack_from("I", buf, offset + 20)[0]
+                        if socket.ntohs(lport & 0xFFFF) == port:
+                            pid = struct.unpack_from("I", buf, offset + 52)[0]
+                            break
+                        offset += 56
+
         if pid <= 0:
             return "App"
 
@@ -348,6 +367,19 @@ def is_ip_str(host: str) -> bool:
     return False
 
 
+def clean_host(host: str) -> str:
+    """提取规范主机名或 IP（正确处理 IPv6 [addr]:port 及无括号 IPv6）"""
+    h = host.strip()
+    if h.startswith("["):
+        idx = h.find("]")
+        if idx != -1:
+            return h[1:idx].strip().lower()
+    if h.count(":") > 1:
+        # 裸 IPv6 地址 (如 2001:4860:...)
+        return h.lower()
+    return h.split(":")[0].strip().lower()
+
+
 # ---- 动态直连自愈缓存 ----
 g_dynamic_direct = set()
 g_dynamic_lock = threading.Lock()
@@ -362,8 +394,11 @@ NEVER_DIRECT_DOMAINS = (
 
 def add_dynamic_direct(host: str):
     """动态记录异常断开的域名，自动加入直连自愈列表（阻断/AI域名除外，避免泄漏国内IP）"""
-    h = host.split(":")[0].strip().lower()
+    h = clean_host(host)
     if not h:
+        return
+    # 纯 IP 地址 (IPv4 / IPv6) 绝不加入自愈直连白名单，防止海外 IP 污染直连导致死循环与超时
+    if is_ip_str(h):
         return
     for blk in NEVER_DIRECT_DOMAINS:
         if h == blk or h.endswith("." + blk):
@@ -408,7 +443,7 @@ def decide_route(host: str, port: int, proc_name: str = None) -> tuple:
             return True, g_cfg.nodes[g_cfg.current_node].name if g_cfg.nodes else None
 
     # 3. 优先检查自愈动态直连缓存
-    h_clean = host.split(":")[0].strip().lower()
+    h_clean = clean_host(host)
     with g_dynamic_lock:
         if h_clean in g_dynamic_direct:
             return False, None
@@ -561,6 +596,9 @@ def dial_host(host: str, port: int, timeout: float = HANDSHAKE_TIMEOUT) -> socke
                         s.bind((bind_ip6, 0))
                     except OSError:
                         pass
+                else:
+                    import errno
+                    raise OSError(errno.ENETUNREACH, f"IPv6 unreachable: physical uplink has no IPv6 for {host}")
             elif bind_ip:
                 if not _is_ip_literal(host):
                     resolved = _tun_dns_resolve(host)
@@ -1023,17 +1061,16 @@ def handle_socks5(client: socket.socket, client_ip: str, client_port: int = 0):
     """处理 SOCKS5 代理请求"""
     try:
         # 读取 methods
-        data = _recv_all(client, 2)
-        if not data or data[0] != 0x05:
+        # 读取 methods 数量 (版本字节 0x05 已在 handle_client 中读取)
+        nm_b = _recv_all(client, 1)
+        if not nm_b:
             return
-        nm = data[1]
+        nm = nm_b[0]
         if nm > 60:
             return
         methods = _recv_all(client, nm)
         if not methods:
             return
-
-        # 回复无认证
         client.sendall(b"\x05\x00")
 
         # 读取请求
