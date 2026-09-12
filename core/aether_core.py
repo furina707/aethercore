@@ -74,7 +74,7 @@ class Node:
 class Config:
     __slots__ = ("listen_ip", "listen_port", "ctrl_ip", "ctrl_port",
                  "nodes", "node_count", "current_node",
-                 "direct_domains", "proxy_domains", "route_domains",
+                 "direct_domains", "proxy_domains", "route_domains", "route_cidrs",
                  "direct_cidrs", "default_proxy",
                  "direct_processes", "proxy_processes")
 
@@ -89,6 +89,7 @@ class Config:
         self.direct_domains = []
         self.proxy_domains = []
         self.route_domains = []  # [(domain_pattern, target), ...]
+        self.route_cidrs = []    # [(IPv4Network, target), ...]
         self.direct_cidrs = []
         self.default_proxy = True  # True=proxy, False=direct
         self.direct_processes = []
@@ -227,11 +228,37 @@ def traffic_add(is_up: bool, n: int):
         g_down_bytes += n
 
 
+# 常见 Google 官方 IPv4 网段 (ASN 15169 与 Google Cloud/AI 常见端点，保证 IP 拨号不走偏)
+GOOGLE_DEFAULT_CIDRS = [
+    "172.217.0.0/16",
+    "142.250.0.0/15",
+    "173.194.0.0/16",
+    "216.58.192.0/19",
+    "74.125.0.0/16",
+    "64.233.160.0/19",
+    "66.102.0.0/20",
+    "66.249.64.0/19",
+    "108.177.0.0/17",
+    "209.85.128.0/17",
+    "216.239.32.0/19",
+    "172.253.0.0/16",
+    "8.8.4.0/24",
+    "8.8.8.0/24",
+    "34.0.0.0/9",
+    "34.128.0.0/10",
+    "35.184.0.0/13",
+    "35.192.0.0/12",
+    "35.208.0.0/12",
+    "35.224.0.0/12",
+    "35.240.0.0/13",
+]
+
+
 # ---- 自定义覆盖配置与节点匹配 ----
-def load_override_rules(base_dir: str = None) -> list:
+def load_override_rules(base_dir: str = None) -> tuple:
     """
     加载 Override-Configuration.json 中的自定义配置
-    返回 [(domain_pattern, target), ...]
+    返回 ([(domain_pattern, target), ...], [(IPv4Network, target), ...])
     """
     candidates = []
     if base_dir:
@@ -249,43 +276,78 @@ def load_override_rules(base_dir: str = None) -> list:
             break
 
     if not target_file:
-        return []
+        return [], []
 
-    rules = []
+    dom_rules = []
+    cidr_rules = []
     try:
         with open(target_file, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
-            # 格式 1: {"rules": [{"target": "...", "domains": [...]}, ...]}
+            # 格式 1: {"rules": [{"target": "...", "domains": [...], "cidrs": [...]}, ...]}
             if "rules" in data and isinstance(data["rules"], list):
                 for item in data["rules"]:
                     if isinstance(item, dict):
                         tgt = str(item.get("target", "")).strip()
                         doms = item.get("domains", [])
+                        raw_cidrs = list(item.get("cidrs", item.get("ips", [])))
+                        name = str(item.get("name", "")).strip()
+                        is_google = (
+                            "google" in name.lower() or
+                            "google" in tgt.lower() or
+                            any("google" in str(d).lower() for d in doms)
+                        )
+                        if is_google:
+                            for gc in GOOGLE_DEFAULT_CIDRS:
+                                if gc not in raw_cidrs:
+                                    raw_cidrs.append(gc)
+
                         if tgt and doms:
                             for d in doms:
                                 d_str = str(d).strip()
-                                if d_str and (d_str, tgt) not in rules:
-                                    rules.append((d_str, tgt))
-            # 格式 2: {"rules": {"domain": "target", ...}}
+                                if d_str and (d_str, tgt) not in dom_rules:
+                                    dom_rules.append((d_str, tgt))
+
+                        if tgt and raw_cidrs:
+                            for c in raw_cidrs:
+                                try:
+                                    net = ipaddress.IPv4Network(str(c).strip(), strict=False)
+                                    if (net, tgt) not in cidr_rules:
+                                        cidr_rules.append((net, tgt))
+                                except Exception:
+                                    pass
+
+            # 格式 2: {"rules": {"domain_or_cidr": "target", ...}}
             elif "rules" in data and isinstance(data["rules"], dict):
-                for d, tgt in data["rules"].items():
-                    d_str = str(d).strip()
+                for k, tgt in data["rules"].items():
+                    k_str = str(k).strip()
                     t_str = str(tgt).strip()
-                    if d_str and t_str and (d_str, t_str) not in rules:
-                        rules.append((d_str, t_str))
-            # 格式 3: {"domain": "target", ...}
+                    if k_str and t_str:
+                        try:
+                            net = ipaddress.IPv4Network(k_str, strict=False)
+                            if (net, t_str) not in cidr_rules:
+                                cidr_rules.append((net, t_str))
+                        except ValueError:
+                            if (k_str, t_str) not in dom_rules:
+                                dom_rules.append((k_str, t_str))
+            # 格式 3: {"domain_or_cidr": "target", ...}
             else:
-                for d, tgt in data.items():
+                for k, tgt in data.items():
                     if isinstance(tgt, str):
-                        d_str = str(d).strip()
+                        k_str = str(k).strip()
                         t_str = str(tgt).strip()
-                        if d_str and t_str and (d_str, t_str) not in rules:
-                            rules.append((d_str, t_str))
+                        if k_str and t_str:
+                            try:
+                                net = ipaddress.IPv4Network(k_str, strict=False)
+                                if (net, t_str) not in cidr_rules:
+                                    cidr_rules.append((net, t_str))
+                            except ValueError:
+                                if (k_str, t_str) not in dom_rules:
+                                    dom_rules.append((k_str, t_str))
     except Exception as e:
         core_log(f"[!] 读取 Override-Configuration.json 异常: {e}")
 
-    return rules
+    return dom_rules, cidr_rules
 
 
 def resolve_node_by_target(target: str, nodes: list, default_name: str = None) -> str:
@@ -417,6 +479,14 @@ def load_config(path: str) -> bool:
                     d = parts[1].strip()
                     if d not in new_cfg.proxy_domains:
                         new_cfg.proxy_domains.append(d)
+                elif cmd in ("route-ip", "route-cidr") and len(parts) >= 3:
+                    ip_str = parts[1].strip()
+                    target = parts[2].strip()
+                    try:
+                        cidr = ipaddress.IPv4Network(ip_str, strict=False)
+                        new_cfg.route_cidrs.append((cidr, target))
+                    except ValueError:
+                        pass
                 elif cmd == "direct-ip" and len(parts) >= 2:
                     try:
                         cidr = ipaddress.IPv4Network(parts[1].strip(), strict=False)
@@ -442,9 +512,11 @@ def load_config(path: str) -> bool:
 
     # 加载 Override-Configuration.json 自定义配置（优先级最高）
     override_dir = os.path.dirname(os.path.abspath(path)) if path else g_data_dir
-    overrides = load_override_rules(override_dir)
-    if overrides:
-        new_cfg.route_domains = overrides + new_cfg.route_domains
+    dom_overrides, cidr_overrides = load_override_rules(override_dir)
+    if dom_overrides:
+        new_cfg.route_domains = dom_overrides + new_cfg.route_domains
+    if cidr_overrides:
+        new_cfg.route_cidrs = cidr_overrides + new_cfg.route_cidrs
 
     # 尽量保留旧配置选中的节点
     if g_cfg and g_cfg.nodes and 0 <= g_cfg.current_node < len(g_cfg.nodes):
@@ -596,6 +668,16 @@ def decide_route(host: str, port: int, proc_name: str = None) -> tuple:
             proc_forced_node = default_node
 
     # 2. 最高优先级：自定义覆盖配置规则 (Override-Configuration.json) 与专有路由
+    if is_ip_str(host):
+        try:
+            ip_obj = ipaddress.IPv4Address(h_clean.strip("[]"))
+            for net, target in g_cfg.route_cidrs:
+                if ip_obj in net:
+                    matched_node = resolve_node_by_target(target, g_cfg.nodes, default_node)
+                    return True, matched_node
+        except Exception:
+            pass
+
     if g_cfg.route_domains:
         for d, target in g_cfg.route_domains:
             if domain_suffix_match(h_clean, d) or (host and domain_suffix_match(host.lower(), d)):

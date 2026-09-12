@@ -346,6 +346,8 @@ with open(conf_file_override, "w", encoding="utf-8") as f:
         "route-domain\t.binance.com\t🇸🇬新加坡01 | 电信联通推荐\n"
         "route-domain\t.asterdex.com\t🇸🇬新加坡01 | 电信联通推荐\n"
         "route-domain\t.google.com\t🇺🇸美国06-0.1倍 | 电信联通移动推荐\n"
+        "route-ip\t172.217.0.0/16\t🇺🇸美国06-0.1倍 | 电信联通移动推荐\n"
+        "route-ip\t34.0.0.0/9\t🇺🇸美国06-0.1倍 | 电信联通移动推荐\n"
         "direct-domain\t.cn\n"
         "direct-domain\t.baidu.com\n"
         "default\tproxy\n"
@@ -366,6 +368,12 @@ check("route api.asterdex.com to sg", r_asterdex_sub[0] is True and "新加坡01
 
 r_google = ac.decide_route("google.com", 443)
 check("route google to us06", r_google[0] is True and "06" in r_google[1], str(r_google))
+
+r_google_ip = ac.decide_route("172.217.115.4", 443)
+check("route google ip to us06", r_google_ip[0] is True and "06" in r_google_ip[1], str(r_google_ip))
+
+r_google_cloud_ip = ac.decide_route("34.54.84.110", 443)
+check("route google cloud ip to us06", r_google_cloud_ip[0] is True and "06" in r_google_cloud_ip[1], str(r_google_cloud_ip))
 
 r_other = ac.decide_route("other-site.org", 443)
 check("route other to default us01", r_other[0] is True and "01" in r_other[1], str(r_other))

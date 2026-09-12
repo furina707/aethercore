@@ -15,6 +15,7 @@ import socket
 import struct
 import threading
 import time
+import subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aether_tun import (
@@ -273,6 +274,8 @@ class TunEngine:
         self.udp = None
         self._reader = None
         self._stop = threading.Event()
+        self._phys_if_index = None
+        self._orig_phys_dns = None
 
     def start(self):
         """启动引擎 (需管理员权限)。物理探测必须在安装接管路由之前完成。"""
@@ -324,6 +327,9 @@ class TunEngine:
         else:
             self.log("[tun] 已接管 v4 (0.0.0.0/1+128.0.0.0/1) 默认路由 (物理出口无 IPv6，已跳过 v6 接管)")
 
+        # 重定向物理网卡 DNS 至 Fake-IP DNS，接管系统 DNS 查询并清空旧缓存
+        self._set_physical_dns()
+
         self.dns = FakeIPDNS(bind_ip=self.phys["v4_ip"], bind_ip6=self.phys.get("v6_ip"),
                              log=self.log)
         self.tcp = TcpStack(self.device, self.dns, self.socks_addr, log=self.log)
@@ -336,8 +342,62 @@ class TunEngine:
         self._reader.start()
         self.log("[tun] TUN 引擎已启动，开始接管全局流量")
 
+    def _set_physical_dns(self):
+        """将物理网卡 DNS 设置为 AetherCore TUN Fake-IP DNS (198.19.0.1)，接管全局 DNS 查询"""
+        phys_if = self.phys.get("if_index_v4")
+        if not phys_if:
+            return
+        self._phys_if_index = phys_if
+        self._orig_phys_dns = []
+        flags = 0x08000000 if sys.platform == 'win32' else 0
+        try:
+            cmd = f"(Get-DnsClientServerAddress -InterfaceIndex {phys_if} -AddressFamily IPv4).ServerAddresses"
+            res = subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                                 capture_output=True, text=True, timeout=3, creationflags=flags)
+            if res.returncode == 0 and res.stdout:
+                addrs = [a.strip() for a in res.stdout.splitlines() if a.strip()]
+                self._orig_phys_dns = addrs
+        except Exception:
+            pass
+
+        try:
+            cmd = f"Set-DnsClientServerAddress -InterfaceIndex {phys_if} -ServerAddresses @('{TUN_V4_IP}')"
+            subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                           capture_output=True, timeout=3, creationflags=flags)
+            self.log(f"[tun-dns] 物理网卡 (ifIndex={phys_if}) DNS 已重定向至 Fake-IP DNS ({TUN_V4_IP})")
+        except Exception as e:
+            self.log(f"[tun-dns] 重定向物理网卡 DNS 异常: {e}")
+
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-Command", "Clear-DnsClientCache"],
+                           capture_output=True, timeout=2, creationflags=flags)
+        except Exception:
+            pass
+
+    def _restore_physical_dns(self):
+        """还原物理网卡 DNS 设置"""
+        phys_if = getattr(self, "_phys_if_index", None)
+        if not phys_if:
+            return
+        flags = 0x08000000 if sys.platform == 'win32' else 0
+        orig = getattr(self, "_orig_phys_dns", None)
+        try:
+            if orig:
+                addrs_str = ", ".join(f"'{a}'" for a in orig)
+                cmd = f"Set-DnsClientServerAddress -InterfaceIndex {phys_if} -ServerAddresses @({addrs_str})"
+            else:
+                cmd = f"Set-DnsClientServerAddress -InterfaceIndex {phys_if} -ResetServerAddresses"
+            subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                           capture_output=True, timeout=3, creationflags=flags)
+            subprocess.run(["powershell", "-NoProfile", "-Command", "Clear-DnsClientCache"],
+                           capture_output=True, timeout=2, creationflags=flags)
+            self.log(f"[tun-dns] 物理网卡 (ifIndex={phys_if}) DNS 已恢复")
+        except Exception as e:
+            self.log(f"[tun-dns] 恢复物理网卡 DNS 异常: {e}")
+
     def stop(self):
         self._stop.set()
+        self._restore_physical_dns()
         if self.tcp:
             self.tcp.stop()
         if self.udp:

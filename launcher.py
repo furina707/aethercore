@@ -607,6 +607,24 @@ def wait_core_listen(host: str, port: int, timeout: float = 8.0) -> bool:
     return False
 
 
+def clean_conflicting_proxies(log_func=None):
+    """清理可能冲突的第三方代理进程 (如 Clash Verge / Mihomo / Sing-box 等)"""
+    targets = ["clash-verge.exe", "verge-mihomo-alpha.exe", "clash.exe", "mihomo.exe"]
+    flags = 0x08000000 if sys.platform == 'win32' else 0
+    for proc in targets:
+        try:
+            res = subprocess.run(["taskkill", "/F", "/IM", proc],
+                                 capture_output=True, timeout=2, creationflags=flags)
+            if res.returncode == 0:
+                msg = f"[*] 检测到第三方代理残留进程 {proc}，已自动安全中止以防劫持冲突"
+                if log_func:
+                    log_func(msg)
+                else:
+                    print(msg, flush=True)
+        except Exception:
+            pass
+
+
 def start_tun_engine():
     """启动 TUN 引擎 (需管理员权限)"""
     global _TUN_ENGINE
@@ -620,6 +638,8 @@ def start_tun_engine():
         except Exception:
             pass
         print(f"{Color.CYAN}{msg}{Color.RESET}", flush=True)
+
+    clean_conflicting_proxies(tun_log)
 
     eng = TunEngine(socks_addr=(host, port), conf_path=CORE_CONF, log=tun_log)
     eng.start()
@@ -635,6 +655,9 @@ def stop_tun_engine():
             pass
         _TUN_ENGINE = None
     _TUN_MODE["active"] = False
+
+
+atexit.register(stop_tun_engine)
 
 
 def start_core():
