@@ -23,5 +23,7 @@ data/nodes_cache.json
 data/app_rules.json
 
 # 运行时
-*.logdata/aethercore.pid
+*.log
+*.pid
+data/aethercore.pid
 data/Override-Configuration.json
