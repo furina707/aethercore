@@ -28,11 +28,12 @@ DEFAULT_UPSTREAMS = ["223.5.5.5", "119.29.29.29", "8.8.8.8"]
 DNS_PORT = 53
 QTYPES = {"A": 1, "PTR": 12, "AAAA": 28, "HTTPS": 65}
 
-# 最低分配地址，避开网段头几个保留地址 (如 198.18.0.1 是 TUN 网关)
-V4_ALLOC_BASE = int(ipaddress.IPv4Address("198.18.0.10"))
+# 最低分配地址，避开网段头几个保留地址 (如 198.19.0.1 是 TUN 网关)
+# 采用 198.19.x.x 作为 AetherCore 的 Fake-IP 分配段，彻底物理隔离 198.18.x.x (第三方代理残留)
+V4_ALLOC_BASE = int(ipaddress.IPv4Address("198.19.0.10"))
 V4_ALLOC_END = int(ipaddress.IPv4Address("198.19.255.254"))
-V6_ALLOC_BASE = int(ipaddress.IPv6Address("fdfe:dcba:9876::10"))
-V6_ALLOC_END = int(ipaddress.IPv6Address("fdfe:dcba:9876:0:ffff:ffff:ffff:fffe"))
+V6_ALLOC_BASE = int(ipaddress.IPv6Address("fdfe:dcba:9877::10"))
+V6_ALLOC_END = int(ipaddress.IPv6Address("fdfe:dcba:9877:0:ffff:ffff:ffff:fffe"))
 
 
 class FakeIPPool:

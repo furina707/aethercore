@@ -74,7 +74,7 @@ class Node:
 class Config:
     __slots__ = ("listen_ip", "listen_port", "ctrl_ip", "ctrl_port",
                  "nodes", "node_count", "current_node",
-                 "direct_domains", "proxy_domains",
+                 "direct_domains", "proxy_domains", "route_domains",
                  "direct_cidrs", "default_proxy",
                  "direct_processes", "proxy_processes")
 
@@ -88,6 +88,7 @@ class Config:
         self.current_node = 0
         self.direct_domains = []
         self.proxy_domains = []
+        self.route_domains = []  # [(domain_pattern, target), ...]
         self.direct_cidrs = []
         self.default_proxy = True  # True=proxy, False=direct
         self.direct_processes = []
@@ -226,6 +227,134 @@ def traffic_add(is_up: bool, n: int):
         g_down_bytes += n
 
 
+# ---- 自定义覆盖配置与节点匹配 ----
+def load_override_rules(base_dir: str = None) -> list:
+    """
+    加载 Override-Configuration.json 中的自定义配置
+    返回 [(domain_pattern, target), ...]
+    """
+    candidates = []
+    if base_dir:
+        candidates.append(os.path.join(base_dir, "Override-Configuration.json"))
+    if g_data_dir:
+        candidates.append(os.path.join(g_data_dir, "Override-Configuration.json"))
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(os.path.dirname(script_dir), "data", "Override-Configuration.json"))
+    candidates.append(r"C:\Users\cytsh\Desktop\proxy\aethercore\data\Override-Configuration.json")
+
+    target_file = None
+    for c in candidates:
+        if c and os.path.exists(c):
+            target_file = c
+            break
+
+    if not target_file:
+        return []
+
+    rules = []
+    try:
+        with open(target_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            # 格式 1: {"rules": [{"target": "...", "domains": [...]}, ...]}
+            if "rules" in data and isinstance(data["rules"], list):
+                for item in data["rules"]:
+                    if isinstance(item, dict):
+                        tgt = str(item.get("target", "")).strip()
+                        doms = item.get("domains", [])
+                        if tgt and doms:
+                            for d in doms:
+                                d_str = str(d).strip()
+                                if d_str and (d_str, tgt) not in rules:
+                                    rules.append((d_str, tgt))
+            # 格式 2: {"rules": {"domain": "target", ...}}
+            elif "rules" in data and isinstance(data["rules"], dict):
+                for d, tgt in data["rules"].items():
+                    d_str = str(d).strip()
+                    t_str = str(tgt).strip()
+                    if d_str and t_str and (d_str, t_str) not in rules:
+                        rules.append((d_str, t_str))
+            # 格式 3: {"domain": "target", ...}
+            else:
+                for d, tgt in data.items():
+                    if isinstance(tgt, str):
+                        d_str = str(d).strip()
+                        t_str = str(tgt).strip()
+                        if d_str and t_str and (d_str, t_str) not in rules:
+                            rules.append((d_str, t_str))
+    except Exception as e:
+        core_log(f"[!] 读取 Override-Configuration.json 异常: {e}")
+
+    return rules
+
+
+def resolve_node_by_target(target: str, nodes: list, default_name: str = None) -> str:
+    """
+    根据目标（具体节点全名、关键词如'新加坡'/'美国06'/'SG'等）解析最匹配的节点名称。
+    """
+    if not nodes or not target:
+        return default_name
+
+    target_clean = str(target).strip()
+    target_lower = target_clean.lower()
+
+    # 1. 精确完全匹配节点名称
+    for n in nodes:
+        if n.name.strip().lower() == target_lower:
+            return n.name
+
+    # 2. 地区常见关键词字典
+    REGION_KEYWORDS = {
+        "新加坡": ["新加坡", "singapore", "sg", "🇸🇬"],
+        "香港": ["香港", "hong kong", "hongkong", "hk", "🇭🇰"],
+        "日本": ["日本", "japan", "jp", "🇯🇵", "东京", "大阪"],
+        "美国": ["美国", "united states", "usa", "us", "🇺🇸"],
+        "台湾": ["台湾", "taiwan", "tw", "🇹🇼"],
+        "韩国": ["韩国", "korea", "kr", "🇰🇷", "首尔"],
+        "英国": ["英国", "uk", "united kingdom", "🇬🇧", "伦敦"],
+        "德国": ["德国", "germany", "de", "🇩🇪", "法兰克福"],
+    }
+
+    # 3. 关键词特征加权评分匹配
+    tokens = [t.lower() for t in re.findall(r'[\u4e00-\u9fa5]+|[a-zA-Z]+|\d+(?:\.\d+)?(?:倍)?', target_clean)]
+    extra_kws = []
+    for reg, kws in REGION_KEYWORDS.items():
+        if reg in target_clean or any(k in target_lower for k in kws):
+            extra_kws.extend(kws)
+            break
+
+    best_score = -1
+    best_node = None
+    for n in nodes:
+        n_low = n.name.lower()
+        score = 0
+        for tok in tokens:
+            if tok in n_low:
+                if any(char.isdigit() for char in tok):
+                    score += 5  # 数字编号（如 01, 06）高权重
+                elif tok in ("0.1倍", "0.01倍", "倍"):
+                    score += 2
+                else:
+                    score += 3
+        for ek in extra_kws:
+            if ek.lower() in n_low:
+                score += 4
+                break
+        if score > best_score:
+            best_score = score
+            best_node = n.name
+
+    if best_score > 0 and best_node:
+        return best_node
+
+    # 4. 降级：模糊子串包含
+    for n in nodes:
+        if target_lower in n.name.lower() or n.name.lower() in target_lower:
+            return n.name
+
+    return default_name
+
+
 # ---- 配置加载 ----
 def load_config(path: str) -> bool:
     """加载 core.conf 配置 (支持原子热重载)"""
@@ -272,10 +401,18 @@ def load_config(path: str) -> bool:
                         n.ws_host = parts[8].strip().rstrip("}, \t\r\n") if len(parts) >= 9 else n.sni
                     new_cfg.nodes.append(n)
                     new_cfg.node_count += 1
+                elif cmd in ("route-domain", "node-domain") and len(parts) >= 3:
+                    d = parts[1].strip()
+                    target = parts[2].strip()
+                    new_cfg.route_domains.append((d, target))
                 elif cmd == "direct-domain" and len(parts) >= 2:
                     d = parts[1].strip()
                     if d not in new_cfg.direct_domains:
                         new_cfg.direct_domains.append(d)
+                elif cmd == "proxy-domain" and len(parts) >= 3:
+                    d = parts[1].strip()
+                    target = parts[2].strip()
+                    new_cfg.route_domains.append((d, target))
                 elif cmd == "proxy-domain" and len(parts) >= 2:
                     d = parts[1].strip()
                     if d not in new_cfg.proxy_domains:
@@ -302,6 +439,12 @@ def load_config(path: str) -> bool:
 
     if new_cfg.node_count == 0 and new_cfg.default_proxy:
         return False
+
+    # 加载 Override-Configuration.json 自定义配置（优先级最高）
+    override_dir = os.path.dirname(os.path.abspath(path)) if path else g_data_dir
+    overrides = load_override_rules(override_dir)
+    if overrides:
+        new_cfg.route_domains = overrides + new_cfg.route_domains
 
     # 尽量保留旧配置选中的节点
     if g_cfg and g_cfg.nodes and 0 <= g_cfg.current_node < len(g_cfg.nodes):
@@ -389,7 +532,7 @@ NEVER_DIRECT_DOMAINS = (
     "googleusercontent.com", "googlevideo.com", "youtube.com", "ytimg.com",
     "github.com", "githubusercontent.com", "openai.com", "anthropic.com",
     "claude.ai", "chatgpt.com", "twitter.com", "x.com", "telegram.org",
-    "wikipedia.org", "wikimedia.org"
+    "wikipedia.org", "wikimedia.org", "asterdex.com", "binance.com"
 )
 
 def add_dynamic_direct(host: str):
@@ -415,9 +558,14 @@ def decide_route(host: str, port: int, proc_name: str = None) -> tuple:
     路由决策
     返回 (is_proxy: bool, node_name: str or None)
     """
+    h_clean = clean_host(host)
+    default_node = g_cfg.nodes[g_cfg.current_node].name if (g_cfg.nodes and 0 <= g_cfg.current_node < len(g_cfg.nodes)) else None
+
+    # 1. 进程规则检测（仅在明确要求直连时拦截；auto/proxy 或特定节点均允许域名覆盖规则生效）
+    proc_forced_node = None
     if proc_name:
         p_low = proc_name.lower().strip()
-        # 1. 优先查 app_rules.json
+        # 1.1 优先查 app_rules.json
         if g_data_dir:
             try:
                 from core.aether_rules import rules_get
@@ -426,24 +574,35 @@ def decide_route(host: str, port: int, proc_name: str = None) -> tuple:
                     app_rule = app_rule.lower().strip()
                     if app_rule == "direct":
                         return False, None
-                    elif app_rule in ("proxy", "auto"):
-                        return True, g_cfg.nodes[g_cfg.current_node].name if g_cfg.nodes else None
+                    elif app_rule == "auto":
+                        # 自动优选：完全跟随分流规则
+                        pass
+                    elif app_rule == "proxy":
+                        proc_forced_node = default_node
                     else:
                         for n in g_cfg.nodes:
                             if n.name.lower() == app_rule:
-                                return True, n.name
-                        return True, g_cfg.nodes[g_cfg.current_node].name if g_cfg.nodes else None
+                                proc_forced_node = n.name
+                                break
+                        if not proc_forced_node:
+                            proc_forced_node = default_node
             except Exception:
                 pass
 
-        # 2. 检查 core.conf 中定义的 direct-process / proxy-process
+        # 1.2 检查 core.conf 中定义的 direct-process / proxy-process
         if p_low in g_cfg.direct_processes:
             return False, None
-        if p_low in g_cfg.proxy_processes:
-            return True, g_cfg.nodes[g_cfg.current_node].name if g_cfg.nodes else None
+        if p_low in g_cfg.proxy_processes and not proc_forced_node:
+            proc_forced_node = default_node
 
-    # 3. 优先检查自愈动态直连缓存
-    h_clean = clean_host(host)
+    # 2. 最高优先级：自定义覆盖配置规则 (Override-Configuration.json) 与专有路由
+    if g_cfg.route_domains:
+        for d, target in g_cfg.route_domains:
+            if domain_suffix_match(h_clean, d) or (host and domain_suffix_match(host.lower(), d)):
+                matched_node = resolve_node_by_target(target, g_cfg.nodes, default_node)
+                return True, matched_node
+
+    # 3. 检查自愈动态直连缓存
     with g_dynamic_lock:
         if h_clean in g_dynamic_direct:
             return False, None
@@ -451,13 +610,17 @@ def decide_route(host: str, port: int, proc_name: str = None) -> tuple:
             if domain_suffix_match(h_clean, d):
                 return False, None
 
-    # 4. 域名分流规则
+    # 4. 进程强制指定节点（未命中自定义域名规则时的降级）
+    if proc_forced_node:
+        return True, proc_forced_node
+
+    # 5. 域名分流规则
     if match_domains(host, g_cfg.direct_domains):
         return False, None
     if match_domains(host, g_cfg.proxy_domains):
-        return True, g_cfg.nodes[g_cfg.current_node].name if g_cfg.nodes else None
+        return True, default_node
 
-    # 5. IP / CIDR / GeoIP 分流规则
+    # 6. IP / CIDR / GeoIP 分流规则
     if is_ip_str(host):
         if match_cidrs(host):
             return False, None
@@ -468,10 +631,11 @@ def decide_route(host: str, port: int, proc_name: str = None) -> tuple:
         except Exception:
             pass
 
-    # 6. 默认动作
+    # 7. 默认动作
     if g_cfg.default_proxy and g_cfg.node_count > 0:
-        return True, g_cfg.nodes[g_cfg.current_node].name
+        return True, default_node
     return False, None
+
 
 
 # ---- VLESS 协议 ----
@@ -514,7 +678,7 @@ def vless_build_header(node: Node, host: str, port: int) -> bytes:
 
 # ---- 出站连接 ----
 FAKE_V4_NET_STR = "198.18.0.0/15"   # TUN Fake-IPv4 网段 (与 aether_tun.py 一致)
-FAKE_V6_NET_STR = "fdfe:dcba:9876::/48"
+FAKE_V6_NET_STR = "fdfe:dcba:9877::/48"
 
 
 def _is_fake_ip(host: str) -> bool:
@@ -1469,12 +1633,18 @@ def handle_controller(client: socket.socket):
         method = parts[0]
         path = parts[1]
 
-        # 读取并丢弃请求体
+        # 读取完整请求体 (Content-Length)
+        body_bytes = b""
         try:
-            header_end = buf.find(b"\r\n\r\n")
+            sep = b"\r\n\r\n"
+            sep_len = 4
+            header_end = buf.find(sep)
             if header_end == -1:
-                header_end = buf.find(b"\n\n")
+                sep = b"\n\n"
+                sep_len = 2
+                header_end = buf.find(sep)
             if header_end >= 0:
+                body_bytes = buf[header_end + sep_len:]
                 content_length = 0
                 for line in req.split("\r\n"):
                     if line.lower().startswith("content-length:"):
@@ -1482,14 +1652,17 @@ def handle_controller(client: socket.socket):
                             content_length = int(line.split(":", 1)[1].strip())
                         except ValueError:
                             pass
-                remaining = content_length - (len(buf) - header_end - 4)
+                remaining = content_length - len(body_bytes)
                 while remaining > 0:
                     chunk = client.recv(min(remaining, 4096))
                     if not chunk:
                         break
+                    body_bytes += chunk
                     remaining -= len(chunk)
         except Exception:
             pass
+
+        body = body_bytes.decode("utf-8", errors="replace")
 
         if method == "GET" and path == "/version":
             ctrl_handle_version(client)
@@ -1501,7 +1674,6 @@ def handle_controller(client: socket.socket):
             ctrl_handle_proxies(client)
         elif method == "PUT" and path.startswith("/configs"):
             conf_path = g_config_file
-            body = req.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in req else ""
             if body.strip():
                 try:
                     cdata = json.loads(body)

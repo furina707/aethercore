@@ -108,7 +108,8 @@ r65 = dns.handle_query(q65)
 check("HTTPS empty NOERROR", r65 is not None and len(r65) == 12 + len(qname) + 4)
 
 # PTR
-ptr_name = td._encode_qname("10.0.18.198.in-addr.arpa")
+arpa_name = ".".join(reversed(ip4.split("."))) + ".in-addr.arpa"
+ptr_name = td._encode_qname(arpa_name)
 qptr = struct.pack(">HHHHHH", 0xabcd, 0x0100, 1, 0, 0, 0) + ptr_name + struct.pack(">HH", 12, 1)
 rptr = dns.handle_query(qptr)
 check("PTR answered", rptr is not None and b"example" in rptr, str(rptr))
@@ -207,7 +208,8 @@ hang_sock.close()
 print("== dial_host guards ==")
 import aether_core as ac
 check("fake v4 guard", ac._is_fake_ip("198.18.5.5"))
-check("fake v6 guard", ac._is_fake_ip("fdfe:dcba:9876::1234"))
+check("fake v4 198.19 guard", ac._is_fake_ip("198.19.0.10"))
+check("fake v6 guard", ac._is_fake_ip("fdfe:dcba:9877::1234"))
 check("real ip pass", not ac._is_fake_ip("1.2.3.4"))
 try:
     ac.dial_host("198.18.5.5", 80)
@@ -331,6 +333,44 @@ time.sleep(0.1)
 check("hot-reload route changed", route_target("example.com", proc="git.exe") == "DIRECT", f"got {route_target('example.com', proc='git.exe')}")
 ctrl_server.shutdown()
 
+# ---- 11.1 自定义覆盖路由配置 (route-domain & Override-Configuration) 测试 ----
+print("== custom route-domain & override configuration ==")
+conf_file_override = os.path.join(tempfile.gettempdir(), "aether_test_override.conf")
+with open(conf_file_override, "w", encoding="utf-8") as f:
+    f.write(
+        "listen\t127.0.0.1\t7899\n"
+        "controller\t127.0.0.1\t9099\n"
+        "node\t🇸🇬新加坡01 | 电信联通推荐\t3a3405dc-9576-4854-83f4-ceb1d47d57a4\tsg1.example.com\t443\ttls\n"
+        "node\t🇺🇸美国圣何塞06-0.1倍\t3a3405dc-9576-4854-83f4-ceb1d47d57a4\tus6.example.com\t443\ttls\n"
+        "node\t🇺🇸美国圣何塞01-0.1倍\t3a3405dc-9576-4854-83f4-ceb1d47d57a4\tus1.example.com\t443\ttls\n"
+        "route-domain\t.binance.com\t🇸🇬新加坡01 | 电信联通推荐\n"
+        "route-domain\t.asterdex.com\t🇸🇬新加坡01 | 电信联通推荐\n"
+        "route-domain\t.google.com\t🇺🇸美国06-0.1倍 | 电信联通移动推荐\n"
+        "direct-domain\t.cn\n"
+        "direct-domain\t.baidu.com\n"
+        "default\tproxy\n"
+    )
+
+ac.load_config(conf_file_override)
+# 将当前默认主节点设为美国01
+ac.g_cfg.current_node = 2
+
+r_binance = ac.decide_route("binance.com", 443)
+check("route binance to sg", r_binance[0] is True and "新加坡01" in r_binance[1], str(r_binance))
+
+r_asterdex = ac.decide_route("www.asterdex.com", 443)
+check("route www.asterdex.com to sg", r_asterdex[0] is True and "新加坡01" in r_asterdex[1], str(r_asterdex))
+
+r_asterdex_sub = ac.decide_route("api.asterdex.com", 443)
+check("route api.asterdex.com to sg", r_asterdex_sub[0] is True and "新加坡01" in r_asterdex_sub[1], str(r_asterdex_sub))
+
+r_google = ac.decide_route("google.com", 443)
+check("route google to us06", r_google[0] is True and "06" in r_google[1], str(r_google))
+
+r_other = ac.decide_route("other-site.org", 443)
+check("route other to default us01", r_other[0] is True and "01" in r_other[1], str(r_other))
+
+
 # ---- 12. TUN 底层 Ctypes 内存布局与物理网卡探测 ----
 print("== tun ctypes & physical network ==")
 import core.aether_tun as at
@@ -339,16 +379,16 @@ check("phys v4 detected", phys["v4_ip"] is not None, str(phys))
 check("phys gw detected", phys["gw_v4"] is not None, str(phys))
 check("phys ifindex detected", phys["if_index_v4"] > 0, str(phys))
 
-sa4 = at.sockaddr_inet_v4("198.18.0.1")
+sa4 = at.sockaddr_inet_v4("198.19.0.1")
 raw_bytes = bytes(sa4)
 check("sockaddr_inet_v4 family", raw_bytes[0:2] == b"\x02\x00")
 check("sockaddr_inet_v4 port", raw_bytes[2:4] == b"\x00\x00")
-check("sockaddr_inet_v4 addr", raw_bytes[4:8] == socket.inet_aton("198.18.0.1"))
+check("sockaddr_inet_v4 addr", raw_bytes[4:8] == socket.inet_aton("198.19.0.1"))
 
-sa6 = at.sockaddr_inet_v6("fdfe:dcba:9876::1")
+sa6 = at.sockaddr_inet_v6("fdfe:dcba:9877::1")
 raw6 = bytes(sa6)
 check("sockaddr_inet_v6 family", raw6[0:2] == struct.pack("<H", at.AF_INET6_WIN))
-check("sockaddr_inet_v6 addr", raw6[8:24] == socket.inet_pton(socket.AF_INET6, "fdfe:dcba:9876::1"))
+check("sockaddr_inet_v6 addr", raw6[8:24] == socket.inet_pton(socket.AF_INET6, "fdfe:dcba:9877::1"))
 
 check("unicast row address at offset 0", at.MIB_UNICASTIPADDRESS_ROW.Address.offset == 0)
 fwd_row = at.MIB_IPFORWARDROW()

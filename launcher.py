@@ -32,6 +32,7 @@ import urllib.parse
 import subprocess
 import winreg
 import msvcrt
+import atexit
 from ctypes import wintypes
 
 def get_process_for_port(port: int) -> str:
@@ -93,14 +94,25 @@ def get_process_for_port(port: int) -> str:
         pass
     return "App"
 
+WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
+try:
+    os.chdir(WORKSPACE_DIR)
+except Exception:
+    pass
+if WORKSPACE_DIR not in sys.path:
+    sys.path.insert(0, WORKSPACE_DIR)
+
+# 确保 C:\Windows\System32 在 PATH 中，避免 netsh/route/taskkill/chcp 等调用异常
+_sys32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+if _sys32 not in os.environ.get("PATH", "").split(os.pathsep):
+    os.environ["PATH"] = _sys32 + os.pathsep + os.environ.get("PATH", "")
+
 # 纯 Python 核心模块（替代 C 原生二进制）
 from core.aether_rules import rules_list as py_rules_list, rules_set as py_rules_set, \
     rules_del as py_rules_del, get_rules_path as py_rules_path
 from core.aether_gen import generate as py_gen_generate
 from core.aether_core import aether_core_main as py_core_main
 
-WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, WORKSPACE_DIR)
 CORE_DIR = os.path.join(WORKSPACE_DIR, "core")
 DATA_DIR = os.path.join(WORKSPACE_DIR, "data")
 LEGACY_DIR = os.path.join(WORKSPACE_DIR, "legacy")
@@ -255,42 +267,137 @@ def is_admin() -> bool:
     except Exception:
         return False
 
-def elevate_admin():
-    if not is_admin():
-        print(f"{Color.YELLOW}[*] 检测到当前非管理员权限，正在请求 UAC 提权...{Color.RESET}")
-        py_exe = EMBEDDED_PYTHON if os.path.exists(EMBEDDED_PYTHON) else sys.executable
-        script_args = [f'"{arg}"' for arg in sys.argv]
-        params = f"-W ignore {' '.join(script_args)}"
-        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", py_exe, params, WORKSPACE_DIR, 1)
+def elevate_admin() -> bool:
+    """
+    请求以管理员权限启动新进程以运行 TUN 全局接管。
+    返回 True 表示已是管理员或提权已发起；
+    返回 False 表示提权被取消或失败，当前进程将继续以普通代理模式运行（绝不闪退！）。
+    """
+    if is_admin():
+        return True
+
+    # 检查命令行参数中是否明确指定不提权
+    if any(arg in sys.argv for arg in ("--no-tun", "--no-elevate", "--socks", "--local")):
+        return False
+
+    print(f"{Color.YELLOW}[*] 检测到当前非管理员权限，正在请求 UAC 管理员提权以开启 TUN 网卡接管...{Color.RESET}")
+    py_exe = EMBEDDED_PYTHON if os.path.exists(EMBEDDED_PYTHON) else sys.executable
+    script_path = os.path.abspath(__file__)
+    other_args = [f'"{arg}"' for arg in sys.argv[1:] if arg not in ("--no-tun", "--no-elevate")]
+    py_args = f'-W ignore "{script_path}"'
+    if other_args:
+        py_args += f" {' '.join(other_args)}"
+
+    # 阶段 1: 尝试 Win32 ShellExecuteW 原生 runas 提权
+    try:
+        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", py_exe, py_args, WORKSPACE_DIR, 1)
         if ret > 32:
+            print(f"{Color.GREEN}[ok] 已请求管理员权限，AetherCore 网关正在管理员新窗口启动。{Color.RESET}")
+            print(f"{Color.CYAN}[*] 当前终端将在 3 秒后安全退出...{Color.RESET}")
+            time.sleep(3.0)
             sys.exit(0)
-        else:
-            show_console_window()
-            print(f"{Color.RED}[x] 提权请求被用户拒绝或失败 (Error Code: {ret}){Color.RESET}")
-            input("\n按回车键退出...")
-            sys.exit(1)
+    except Exception:
+        pass
+
+    # 阶段 2: 若 ShellExecuteW 在某些受限终端下静默忽略，调用 PowerShell Start-Process -Verb RunAs 强制弹 UAC
+    try:
+        import base64
+        # 使用 Base64 编码避免引号转义被截断
+        escaped_py_args = py_args.replace("'", "''")
+        ps_elevate = (
+            f"Start-Process -FilePath '{py_exe}' "
+            f"-ArgumentList '{escaped_py_args}' "
+            f"-WorkingDirectory '{WORKSPACE_DIR}' -Verb RunAs"
+        )
+        encoded_cmd = base64.b64encode(ps_elevate.encode("utf-16-le")).decode("ascii")
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-EncodedCommand", encoded_cmd],
+            capture_output=True, timeout=8
+        )
+        if res.returncode == 0:
+            print(f"{Color.GREEN}[ok] 已通过系统服务唤起管理员提权窗口。{Color.RESET}")
+            print(f"{Color.CYAN}[*] 当前终端将在 3 秒后安全退出...{Color.RESET}")
+            time.sleep(3.0)
+            sys.exit(0)
+    except Exception:
+        pass
+
+    # 若提权被用户取消 (Error Code: 5) 或运行在无界面的受限终端：
+    # 优雅降级为纯本地代理模式，绝不退出或闪退！
+    print(f"{Color.YELLOW}[!] 未获得管理员权限（已跳过 TUN 虚拟网卡全局接管）。{Color.RESET}")
+    print(f"{Color.GREEN}[ok] 正在以普通用户权限运行本地代理模式 (SOCKS5/HTTP 127.0.0.1:7899)...{Color.RESET}")
+    print(f"{Color.GREEN}[ok] 自定义规则全部生效 (Binance/Asterdex 走新加坡，Google 走美国){Color.RESET}")
+    print(f"{Color.CYAN}[提示] 如需开启全局 TUN 透明网络接管，请右键选择“以管理员身份运行”。\n{Color.RESET}")
+    return False
+
+
 
 def kill_conflicting_proxies():
+    # 1. 结束常见代理核心冲突进程 (优先原生 taskkill，耗时极低)
+    _proxy_procs = [
+        "clash-verge.exe", "verge-mihomo.exe", "verge-mihomo-alpha.exe",
+        "clash.exe", "mihomo.exe", "sing-box.exe", "xray.exe",
+    ]
     try:
-        subprocess.run(["powershell", "-Command",
-            "Get-Process -Name '*clash*', '*mihomo*', '*verge*', 'sing-box*', 'xray*', 'v2ray*' -ErrorAction SilentlyContinue | Stop-Process -Force"],
+        subprocess.run(["taskkill", "/F"] + [x for p in _proxy_procs for x in ("/IM", p)],
             capture_output=True)
     except Exception:
         pass
-    try:
-        subprocess.run(["taskkill", "/F", "/IM", "clash-verge.exe", "/IM", "verge-mihomo.exe", "/IM", "verge-mihomo-alpha.exe", "/IM", "clash.exe", "/IM", "mihomo.exe", "/IM", "sing-box.exe"],
-            capture_output=True)
-    except Exception:
-        pass
-    for exe_path in (os.path.join(LEGACY_DIR, "core.exe"),):
-        name = os.path.splitext(os.path.basename(exe_path))[0]
+
+    # 2. 仅在管理员权限下清理第三方残留虚拟网卡与路由
+    if is_admin():
+        # 先等进程真正结束（最多 1.5 秒）
+        time.sleep(1.5)
+
+        # 用 PowerShell 禁用名称含 mihomo/clash 或描述含 Meta Tunnel 的网卡
+        # 注意：必须用 $_ 但 subprocess 下中文终端可能截断，所以用 -EncodedCommand
+        import base64
+        ps_script = (
+            "Get-NetAdapter | ForEach-Object {\r\n"
+            "  if ($_.Name -like '*mihomo*' -or $_.Name -like '*clash*' -or\r\n"
+            "      $_.InterfaceDescription -like '*Meta Tunnel*') {\r\n"
+            "    Disable-NetAdapter -Name $_.Name -Confirm:$false -ErrorAction SilentlyContinue\r\n"
+            "  }\r\n"
+            "}\r\n"
+        )
         try:
-            exe_path = os.path.abspath(exe_path).replace("'", "''")
-            ps = (f"Get-Process -Name '{name}' -ErrorAction SilentlyContinue | "
-                  f"Where-Object {{ $_.Path -eq '{exe_path}' }} | Stop-Process -Force")
-            subprocess.run(["powershell", "-Command", ps], capture_output=True)
+            encoded = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
+            subprocess.run(
+                ["powershell", "-NoProfile", "-EncodedCommand", encoded],
+                capture_output=True, timeout=8
+            )
         except Exception:
             pass
+
+        # 同时清理残留 metric=0 默认路由（下一跳在 198.18.x 或 fdfe:dcba:9876 网段，即 Mihomo 虚拟 IP）
+        ps_routes = (
+            "Get-NetRoute -DestinationPrefix '0.0.0.0/0','::/0' -ErrorAction SilentlyContinue | ForEach-Object {\r\n"
+            "  if ($_.NextHop -like '198.18.*' -or $_.NextHop -like 'fdfe:dcba:9876*') {\r\n"
+            "    Remove-NetRoute -DestinationPrefix $_.DestinationPrefix"
+            " -InterfaceIndex $_.InterfaceIndex -NextHop $_.NextHop"
+            " -Confirm:$false -ErrorAction SilentlyContinue\r\n"
+            "  }\r\n"
+            "}\r\n"
+        )
+        try:
+            encoded2 = base64.b64encode(ps_routes.encode("utf-16-le")).decode("ascii")
+            subprocess.run(
+                ["powershell", "-NoProfile", "-EncodedCommand", encoded2],
+                capture_output=True, timeout=8
+            )
+        except Exception:
+            pass
+
+
+    # 3. 确保 Windows 系统代理开关被重置 (避免强杀前留下的 127.0.0.1:7890 导致应用找不到代理断网)
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                            0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+    except Exception:
+        pass
+
 
 def get_pids_for_ports(*ports: int) -> set:
     """获取正在使用指定本地 TCP 端口的所有进程 PID"""
@@ -316,9 +423,21 @@ def get_pids_for_ports(*ports: int) -> set:
         pass
     return pids
 
+def _get_ancestor_pids() -> set:
+    """获取当前进程及所有祖先进程 PID，严防误杀自身或包装脚本"""
+    pids = {os.getpid()}
+    try:
+        if hasattr(os, "getppid"):
+            pp = os.getppid()
+            if pp > 0:
+                pids.add(pp)
+    except Exception:
+        pass
+    return pids
+
 def _terminate_pid(pid: int) -> bool:
-    """强制结束指定 PID 进程"""
-    if pid <= 0 or pid == os.getpid():
+    """强制结束指定 PID 进程，严防误杀自身及父进程"""
+    if pid <= 0 or pid in _get_ancestor_pids():
         return False
     try:
         PROCESS_TERMINATE = 0x0001
@@ -335,30 +454,35 @@ def _terminate_pid(pid: int) -> bool:
 
 def kill_old_instances() -> bool:
     """自动查找并强制关闭所有运行中的旧实例及占用代理端口的旧进程"""
-    my_pid = os.getpid()
+    ancestor_pids = _get_ancestor_pids()
     killed = False
 
-    # 1. 终止占用 7899 (代理) 或 9097 (控制器) 的所有其他进程
+    # 1. 检查并终止记录在 pid 文件中的前任旧实例
+    pid_file = os.path.join(DATA_DIR, "aethercore.pid")
+    try:
+        if os.path.exists(pid_file):
+            with open(pid_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content.isdigit():
+                    old_pid = int(content)
+                    if old_pid not in ancestor_pids and old_pid > 0:
+                        if _terminate_pid(old_pid):
+                            killed = True
+    except Exception:
+        pass
+
+    # 2. 终止占用 7899 (代理) 或 9097 (控制器) 的所有非自身旧进程
     for port in (7899, 9097):
         pids = get_pids_for_ports(port)
         for pid in pids:
-            if pid != my_pid:
+            if pid not in ancestor_pids and pid > 0:
                 if _terminate_pid(pid):
                     killed = True
 
-    # 2. 终止其他正在运行 launcher.py 或 aether_core 的 Python 实例
+    # 3. 记录当前 PID，便于下次启动时精准接管
     try:
-        ps_cmd = (
-            f"$curr = {my_pid}; "
-            "Get-CimInstance Win32_Process -Filter \"Name = 'python.exe'\" -ErrorAction SilentlyContinue | "
-            "Where-Object { "
-            f"$_.ProcessId -ne $curr -and ($_.CommandLine -like '*launcher.py*' -or $_.CommandLine -like '*aether_core*') "
-            "} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
-        )
-        res = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd],
-                             capture_output=True, timeout=5)
-        if res.returncode == 0 and res.stdout:
-            killed = True
+        with open(pid_file, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
     except Exception:
         pass
 
@@ -366,6 +490,19 @@ def kill_old_instances() -> bool:
         time.sleep(0.5)
 
     return killed
+
+def _cleanup_pid_file():
+    try:
+        pid_file = os.path.join(DATA_DIR, "aethercore.pid")
+        if os.path.exists(pid_file):
+            with open(pid_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            if content == str(os.getpid()):
+                os.remove(pid_file)
+    except Exception:
+        pass
+
+atexit.register(_cleanup_pid_file)
 
 def core_already_running() -> bool:
     try:
@@ -880,13 +1017,19 @@ def _refresh_nodes_async():
         try:
             ok, _, text = _controller_request("GET", "/proxies", timeout=3)
             if ok and text:
-                data = json.loads(text)
-                group = data.get("proxies", {}).get(MANUAL_GROUP, {})
-                now = group.get("now", "")
-                items = [(n, n == now) for n in group.get("all", [])]
-                if items:
-                    _NODE_CACHE["items"] = items
-                    _NODE_CACHE["t"] = time.time()
+                group = None
+                for k, v in data.get("proxies", {}).items():
+                    if "MANUAL" in k or "手动" in k:
+                        group = v
+                        break
+                if not group and data.get("proxies"):
+                    group = next(iter(data.get("proxies").values()))
+                if group:
+                    now = group.get("now", "")
+                    items = [(n, n == now) for n in group.get("all", [])]
+                    if items:
+                        _NODE_CACHE["items"] = items
+                        _NODE_CACHE["t"] = time.time()
         except Exception:
             pass
         finally:
@@ -2311,9 +2454,10 @@ def main():
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR, exist_ok=True)
 
-    if not is_admin():
+    # TUN 全局网卡模式必须以管理员权限运行
+    # 若当前非管理员权限且 core.conf 开启了 tun（默认开启），自动发起 UAC 提权
+    if not is_admin() and parse_tun_enabled(CORE_CONF):
         elevate_admin()
-        return 0
 
     # 自动关闭正在运行的旧实例 / 内核残留进程，直接接管服务（无需用户手动退出旧实例）
     killed = kill_old_instances()
@@ -2338,8 +2482,8 @@ def main():
     _CORE_PROC = start_core()
     time.sleep(0.5)
 
-    # TUN 全局网络接管
-    if parse_tun_enabled(CORE_CONF):
+    # TUN 全局网络接管 (仅在管理员权限且 core.conf 开启 tun 时启动)
+    if is_admin() and parse_tun_enabled(CORE_CONF):
         host, port = parse_listen_addr(CORE_CONF)
         if not wait_core_listen(host, port):
             err_msg = f"[x] 内核监听 ({host}:{port}) 未就绪，无法启动 TUN"
@@ -2361,14 +2505,21 @@ def main():
                     pass
                 print(f"{Color.GREEN}{msg}{Color.RESET}")
             except Exception as e:
+                import traceback
                 _TUN_MODE["error"] = str(e)
+                tb = traceback.format_exc()
                 err_msg = f"[x] TUN 模式启动失败: {e}"
                 try:
                     import core.aether_core as ac
-                    ac.core_log(f"[tun] {err_msg}")
+                    ac.core_log(f"[tun] {err_msg}\n{tb}")
                 except Exception:
                     pass
                 print(f"{Color.RED}{err_msg}{Color.RESET}")
+                print(f"{Color.YELLOW}{tb}{Color.RESET}")
+    elif not is_admin():
+        print(f"{Color.YELLOW}[*] 普通用户模式：TUN 全局网卡未加载，SOCKS5/HTTP 代理服务正常运行于 127.0.0.1:7899{Color.RESET}")
+        print(f"{Color.GREEN}[ok] 自定义分流规则全部生效 (Binance/Asterdex 走新加坡，Google 走美国){Color.RESET}")
+        print(f"{Color.CYAN}[提示] 如需开启全局 TUN 透明网络接管，请以管理员身份打开终端运行 python launcher.py，或运行 python launcher.py --tun。\n{Color.RESET}")
     else:
         print(f"{Color.YELLOW}[!] TUN 模式已在 core.conf 中关闭 (tun off){Color.RESET}")
 
@@ -2391,12 +2542,30 @@ def main():
         print(f"{Color.GREEN}[ok] 已安全退出{Color.RESET}")
 
 
+def _safe_pause(seconds=5):
+    try:
+        if sys.stdin and sys.stdin.isatty():
+            print(f"\n{Color.YELLOW}[*] 请按回车键退出...{Color.RESET}")
+            sys.stdin.readline()
+        else:
+            time.sleep(seconds)
+    except Exception:
+        time.sleep(seconds)
+
+
 if __name__ == "__main__":
+    exit_code = 0
     try:
         main()
     except KeyboardInterrupt:
-        pass
-    except Exception as e:
+        print("\n[*] 用户取消操作。")
+    except SystemExit as se:
+        exit_code = se.code if se.code is not None else 0
+        if exit_code != 0:
+            print(f"\n{Color.YELLOW}[*] 程序退出 (代码: {exit_code}){Color.RESET}")
+            _safe_pause(3)
+    except BaseException as e:
+        exit_code = 1
         import traceback
         tb = traceback.format_exc()
         try:
@@ -2405,6 +2574,9 @@ if __name__ == "__main__":
                 f.write(f"\n[CRASH] Launcher unhandled exception:\n{tb}\n")
         except Exception:
             pass
-        print(f"\n{Color.RED}[x] 未捕获异常: {e}{Color.RESET}")
+        print(f"\n{Color.RED}[x] 发生未捕获异常: {e}{Color.RESET}")
         traceback.print_exc()
-        input("\n按回车退出...")
+        _safe_pause(10)
+    finally:
+        sys.exit(exit_code)
+

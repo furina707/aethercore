@@ -21,6 +21,7 @@ import time
 import struct
 import socket
 import ipaddress
+import subprocess
 from ctypes import wintypes
 
 # Python 3.15+ 的 ctypes.wintypes 裁剪了部分类型，这里兜底补齐
@@ -61,10 +62,10 @@ AF_INET6_WIN = 23
 
 # Fake-IP 网段 (与 tun_dns.py / aether_core.py 保持一致)
 FAKE_V4_NET = "198.18.0.0/15"
-FAKE_V6_NET = "fdfe:dcba:9876::/48"
-TUN_V4_IP = "198.18.0.1"
+FAKE_V6_NET = "fdfe:dcba:9877::/48"
+TUN_V4_IP = "198.19.0.1"
 TUN_V4_MASK = "255.254.0.0"
-TUN_V6_IP = "fdfe:dcba:9876::1"
+TUN_V6_IP = "fdfe:dcba:9877::1"
 TUN_V6_PREFIX = 126
 
 
@@ -538,9 +539,35 @@ class _IPHLPAPI:
         return luid if rc == 0 else None
 
     def get_ipv4_addr_for_ifindex(self, if_index: int):
-        """GetIpAddrTable: 查找指定接口的 IPv4 地址"""
-        if not self._ensure_loaded():
+        """查找指定接口的 IPv4 地址（优先 GetUnicastIpAddressTable，回退 GetIpAddrTable）"""
+        if not self._ensure_loaded() or not if_index:
             return None
+
+        # 1. 优先使用 Windows Vista+ 的现代 API GetUnicastIpAddressTable
+        try:
+            class _TABLE(ctypes.Structure):
+                _fields_ = [('NumEntries', wintypes.ULONG), ('Table', MIB_UNICASTIPADDRESS_ROW * 1)]
+            pTable = ctypes.POINTER(_TABLE)()
+            if self._dll.GetUnicastIpAddressTable(AF_INET_WIN, ctypes.byref(pTable)) == 0 and pTable:
+                try:
+                    table = pTable.contents
+                    actual_type = type('ActualTable', (ctypes.Structure,), {
+                        '_fields_': [('NumEntries', wintypes.ULONG), ('Table', MIB_UNICASTIPADDRESS_ROW * table.NumEntries)]
+                    })
+                    full_table = ctypes.cast(pTable, ctypes.POINTER(actual_type)).contents
+                    for i in range(full_table.NumEntries):
+                        entry = full_table.Table[i]
+                        if entry.InterfaceIndex == if_index:
+                            ip_bytes = struct.pack('<I', entry.Address.Ipv4.sin_addr.S_un)
+                            ip = socket.inet_ntoa(ip_bytes)
+                            if ip and not ip.startswith('169.254.'):
+                                return ip
+                finally:
+                    self._dll.FreeMibTable(pTable)
+        except Exception:
+            pass
+
+        # 2. 兼容回退使用旧版 GetIpAddrTable
         size = wintypes.ULONG(0)
         self._dll.GetIpAddrTable(None, ctypes.byref(size), False)
         if size.value <= 0:
@@ -550,11 +577,12 @@ class _IPHLPAPI:
             return None
         num = struct.unpack_from("I", buf, 0)[0]
         for i in range(num):
-            off = 4 + i * 24  # MIB_IPADDRROW = 24 字节
-            dw_addr, _mask, dw_if = struct.unpack_from("III", buf, off)
+            off = 4 + i * 24  # MIB_IPADDRROW = 24 字节 (dwAddr, dwIndex, dwMask, ...)
+            dw_addr, dw_if, _mask = struct.unpack_from("III", buf, off)
             if dw_if == if_index:
                 return socket.inet_ntoa(struct.pack("<I", dw_addr))
         return None
+
 
     @staticmethod
     def _mask_to_prefix(mask_str):
@@ -655,8 +683,14 @@ def detect_physical_network():
         s.connect(("2001:4860:4860::8888", 53))
         v6 = s.getsockname()[0].split("%")[0]
         s.close()
-        if v6 and not is_fake_v6(v6) and not v6.startswith("fe80"):
-            info["v6_ip"] = v6
+        if v6 and not is_fake_v6(v6):
+            try:
+                import ipaddress
+                ip_obj = ipaddress.IPv6Address(v6)
+                if ip_obj.is_global and not ip_obj.is_private:
+                    info["v6_ip"] = v6
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -741,7 +775,16 @@ class WintunDevice:
         """配置网卡 IP (v4+v6)、MTU 以及 DNS 服务器"""
         iphlp = _g_iphlp
         iphlp.set_mtu_and_metric(self._luid, mtu, AF_INET_WIN)
-        iphlp.set_ip_address(self._luid, ip_str, mask_str)
+        v4_ok = iphlp.set_ip_address(self._luid, ip_str, mask_str)
+        if not self.verify_ip_assigned(ip_str) and getattr(self, 'interface_index', 0):
+            # 若 Win32 API 未能生效，通过 netsh 兜底配置静态 IP
+            flags = 0x08000000 if sys.platform == 'win32' else 0
+            subprocess.run(
+                ['netsh', 'interface', 'ipv4', 'set', 'address',
+                 f'name={self.interface_index}', 'source=static',
+                 f'address={ip_str}', f'mask={mask_str}'],
+                capture_output=True, timeout=3, creationflags=flags
+            )
         if ipv6_str:
             iphlp.set_mtu_and_metric(self._luid, mtu, AF_INET6_WIN)
             iphlp.set_ip_address(self._luid, ipv6_str, str(ipv6_prefix))
@@ -791,6 +834,23 @@ class WintunDevice:
                                capture_output=True, timeout=3, creationflags=flags)
             except Exception:
                 pass
+
+    def get_current_ipv4(self) -> str:
+        """获取当前 Wintun 网卡分配到的实际 IPv4 地址"""
+        if_idx = getattr(self, 'interface_index', 0)
+        if not if_idx:
+            return None
+        return _g_iphlp.get_ipv4_addr_for_ifindex(if_idx)
+
+    def verify_ip_assigned(self, ip_str=None) -> bool:
+        """验证 Wintun 网卡是否成功获得指定的 IPv4 地址（排除 169.254.x.x 自动私有地址）"""
+        expected = ip_str or TUN_V4_IP
+        current = self.get_current_ipv4()
+        if not current:
+            return False
+        if current.startswith("169.254."):
+            return False
+        return current == expected
 
     def add_route(self, dest_str, prefix_len, gw_str, metric=1):
         """添加经本网卡的路由并登记 (stop 时自动清理)"""

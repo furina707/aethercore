@@ -391,12 +391,53 @@ def generate_core_conf(nodes: list, conf_path: str, rules_path: str) -> bool:
     if used == 0:
         return False
 
+    # 读取 Override-Configuration.json 自定义覆盖规则
+    override_path = os.path.join(os.path.dirname(conf_path), "Override-Configuration.json")
+    override_rules = []
+    override_domains = set()
+    try:
+        if os.path.exists(override_path):
+            with open(override_path, "r", encoding="utf-8") as fp:
+                odata = json.load(fp)
+            if isinstance(odata, dict):
+                if "rules" in odata and isinstance(odata["rules"], list):
+                    for item in odata["rules"]:
+                        if isinstance(item, dict):
+                            tgt = str(item.get("target", "")).strip()
+                            for d in item.get("domains", []):
+                                d_str = str(d).strip().lstrip(".")
+                                if d_str and tgt and (d_str, tgt) not in override_rules:
+                                    override_rules.append((d_str, tgt))
+                                    override_domains.add(d_str.lower())
+                elif "rules" in odata and isinstance(odata["rules"], dict):
+                    for d, tgt in odata["rules"].items():
+                        d_str = str(d).strip().lstrip(".")
+                        tgt_str = str(tgt).strip()
+                        if d_str and tgt_str and (d_str, tgt_str) not in override_rules:
+                            override_rules.append((d_str, tgt_str))
+                            override_domains.add(d_str.lower())
+                else:
+                    for d, tgt in odata.items():
+                        if isinstance(tgt, str):
+                            d_str = str(d).strip().lstrip(".")
+                            tgt_str = tgt.strip()
+                            if d_str and tgt_str and (d_str, tgt_str) not in override_rules:
+                                override_rules.append((d_str, tgt_str))
+                                override_domains.add(d_str.lower())
+    except Exception as e:
+        print(f"[!] 读取 Override-Configuration.json 失败: {e}")
+
+    for d, tgt in override_rules:
+        lines.append(f"route-domain\t.{d}\t{tgt}")
+
     for d in DIRECT_DOMAINS:
         d = d[1:] if d.startswith(".") else d
-        lines.append(f"direct-domain\t.{d}")
+        if d.lower() not in override_domains:
+            lines.append(f"direct-domain\t.{d}")
     for d in PROXY_DOMAINS:
         d = d[1:] if d.startswith(".") else d
-        lines.append(f"proxy-domain\t.{d}")
+        if d.lower() not in override_domains:
+            lines.append(f"proxy-domain\t.{d}")
     for cidr in PRIVATE_CIDRS:
         lines.append(f"direct-ip\t{cidr}")
 
@@ -413,9 +454,10 @@ def generate_core_conf(nodes: list, conf_path: str, rules_path: str) -> bool:
                     data = json.load(fp)
                 if isinstance(data, dict):
                     for proc, target in data.items():
-                        if target.lower() == "direct":
+                        t_low = target.lower().strip()
+                        if t_low == "direct":
                             rule_lines.append(f"direct-process\t{proc}")
-                        else:
+                        elif t_low == "proxy":
                             rule_lines.append(f"proxy-process\t{proc}")
         except Exception:
             pass

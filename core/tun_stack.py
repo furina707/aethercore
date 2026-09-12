@@ -19,7 +19,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aether_tun import (
     WintunDevice, detect_physical_network, is_fake_v4, is_fake_v6, is_fake_ip,
-    TUN_V6_IP,
+    TUN_V4_IP, TUN_V6_IP,
 )
 from tun_dns import FakeIPDNS
 from tun_tcp import TcpStack
@@ -292,6 +292,22 @@ class TunEngine:
         self.device.open()
         has_v6 = bool(self.phys.get("v6_ip"))
         self.device.configure_network(ipv6_str=TUN_V6_IP if has_v6 else None)
+
+        # 熔断安全保护: 验证 TUN 适配器是否成功分配到指定 IP
+        # 允许最多 3 秒等待 Windows 网络栈生效异步就绪
+        ip_assigned = False
+        for _ in range(15):
+            if self.device.verify_ip_assigned(TUN_V4_IP):
+                ip_assigned = True
+                break
+            time.sleep(0.2)
+
+        if not ip_assigned:
+            assigned = self.device.get_current_ipv4()
+            raise RuntimeError(
+                f"TUN 适配器未成功绑定 IP {TUN_V4_IP} (当前网卡检测 IP: {assigned})，"
+                "检测到 IP 被占用或驱动配置失败，已中止全局路由接管以防全机断网！"
+            )
 
         # 节点服务器 /32 主机路由 (双保险: 即使绑定失效也直走物理网关)
         for server in self._node_servers():
