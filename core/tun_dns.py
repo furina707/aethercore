@@ -111,6 +111,30 @@ class FakeIPPool:
             return self._domain2v4.get(domain), self._domain2v6.get(domain)
 
 
+_GLOBAL_FAKE_IP_POOL = getattr(sys, "_aether_fake_ip_pool", None)
+if _GLOBAL_FAKE_IP_POOL is None:
+    _GLOBAL_FAKE_IP_POOL = FakeIPPool()
+    sys._aether_fake_ip_pool = _GLOBAL_FAKE_IP_POOL
+
+
+def get_global_fake_ip_pool() -> FakeIPPool:
+    global _GLOBAL_FAKE_IP_POOL
+    if _GLOBAL_FAKE_IP_POOL is None:
+        _GLOBAL_FAKE_IP_POOL = getattr(sys, "_aether_fake_ip_pool", None)
+        if _GLOBAL_FAKE_IP_POOL is None:
+            _GLOBAL_FAKE_IP_POOL = FakeIPPool()
+            sys._aether_fake_ip_pool = _GLOBAL_FAKE_IP_POOL
+    return _GLOBAL_FAKE_IP_POOL
+
+
+def reverse_fake_ip(ip: str) -> str:
+    """全局 Fake-IP 反查为真实域名 (支持 IPv4 / IPv6，无锁或内部加锁安全)"""
+    pool = get_global_fake_ip_pool()
+    if not ip or pool is None:
+        return None
+    return pool.reverse(ip)
+
+
 def _encode_qname(name: str) -> bytes:
     out = bytearray()
     for label in name.rstrip(".").split("."):
@@ -122,14 +146,14 @@ def _encode_qname(name: str) -> bytes:
 
 
 def _decode_qname(msg: bytes, off: int):
-    """解析 (可含压缩指针的) 域名，返回 (name, next_off)；失败返回 ("", len)"""
+    """解析 (可含压缩指针的) 域名，返回 (name, next_off)；失败返回 ("", len(msg) + 10)"""
     labels = []
     jumped = False
     end = off
     seen = 0
     while True:
-        if off >= len(msg) or seen > 32:
-            return "", len(msg)
+        if off >= len(msg) or seen > 128:
+            return "", len(msg) + 10
         ln = msg[off]
         if ln == 0:
             if not jumped:
@@ -137,7 +161,7 @@ def _decode_qname(msg: bytes, off: int):
             break
         if ln & 0xC0 == 0xC0:
             if off + 1 >= len(msg):
-                return "", len(msg)
+                return "", len(msg) + 10
             ptr = ((ln & 0x3F) << 8) | msg[off + 1]
             if not jumped:
                 end = off + 2
@@ -149,6 +173,14 @@ def _decode_qname(msg: bytes, off: int):
         off += 1 + ln
         seen += 1
     return ".".join(labels), end
+
+
+def skip_dns_question(msg: bytes, off: int = 12) -> int:
+    """跳过 Question (含压缩指针)，返回 Answer 起始偏移；失败返回 -1。"""
+    name, end = _decode_qname(msg, off)
+    if end + 4 > len(msg):
+        return -1
+    return end + 4  # QTYPE + QCLASS
 
 
 def _parse_query(msg: bytes):
@@ -177,8 +209,8 @@ def _build_response(txid: int, qname: str, qtype: int, answers: list) -> bytes:
 class FakeIPDNS:
     """Fake-IP DNS 处理器"""
 
-    def __init__(self, bind_ip=None, bind_ip6=None, upstreams=None, log=None):
-        self.pool = FakeIPPool()
+    def __init__(self, bind_ip=None, bind_ip6=None, upstreams=None, log=None, pool=None):
+        self.pool = pool if pool is not None else get_global_fake_ip_pool()
         self.bind_ip = bind_ip      # 物理网卡 IPv4 (转发上游查询时绑定)
         self.bind_ip6 = bind_ip6
         self.upstreams = upstreams or list(DEFAULT_UPSTREAMS)
@@ -223,7 +255,7 @@ class FakeIPDNS:
                 ip = ".".join(reversed(parts[:4]))
                 return self.pool.reverse_v4(ip)
             if parts[-2:-1] == ["ip6"] and len(parts) == 34:
-                hexdigits = "".join(reversed(parts[1:33]))
+                hexdigits = "".join(reversed(parts[0:32]))
                 try:
                     packed = bytes.fromhex(hexdigits)
                     ip = str(ipaddress.IPv6Address(packed))
@@ -235,6 +267,7 @@ class FakeIPDNS:
     # ---- 上游转发 ----
     def _forward(self, payload: bytes, timeout=3.0):
         for upstream in self.upstreams:
+            s = None
             try:
                 fam = socket.AF_INET6 if ":" in upstream else socket.AF_INET
                 s = socket.socket(fam, socket.SOCK_DGRAM)
@@ -247,13 +280,14 @@ class FakeIPDNS:
                         pass
                 s.sendto(payload, (upstream, DNS_PORT))
                 data, _ = s.recvfrom(4096)
-                s.close()
                 return data
             except Exception:
-                try:
-                    s.close()
-                except Exception:
-                    pass
                 continue
+            finally:
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
         self._log("[tun-dns] 上游转发失败")
         return None

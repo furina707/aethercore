@@ -263,11 +263,10 @@ def load_override_rules(base_dir: str = None) -> tuple:
     candidates = []
     if base_dir:
         candidates.append(os.path.join(base_dir, "Override-Configuration.json"))
-    if g_data_dir:
+    if g_data_dir and g_data_dir != base_dir:
         candidates.append(os.path.join(g_data_dir, "Override-Configuration.json"))
     script_dir = os.path.dirname(os.path.abspath(__file__))
     candidates.append(os.path.join(os.path.dirname(script_dir), "data", "Override-Configuration.json"))
-    candidates.append(r"C:\Users\cytsh\Desktop\proxy\aethercore\data\Override-Configuration.json")
 
     target_file = None
     for c in candidates:
@@ -311,7 +310,7 @@ def load_override_rules(base_dir: str = None) -> tuple:
                         if tgt and raw_cidrs:
                             for c in raw_cidrs:
                                 try:
-                                    net = ipaddress.IPv4Network(str(c).strip(), strict=False)
+                                    net = ipaddress.ip_network(str(c).strip(), strict=False)
                                     if (net, tgt) not in cidr_rules:
                                         cidr_rules.append((net, tgt))
                                 except Exception:
@@ -324,7 +323,7 @@ def load_override_rules(base_dir: str = None) -> tuple:
                     t_str = str(tgt).strip()
                     if k_str and t_str:
                         try:
-                            net = ipaddress.IPv4Network(k_str, strict=False)
+                            net = ipaddress.ip_network(k_str, strict=False)
                             if (net, t_str) not in cidr_rules:
                                 cidr_rules.append((net, t_str))
                         except ValueError:
@@ -338,7 +337,7 @@ def load_override_rules(base_dir: str = None) -> tuple:
                         t_str = str(tgt).strip()
                         if k_str and t_str:
                             try:
-                                net = ipaddress.IPv4Network(k_str, strict=False)
+                                net = ipaddress.ip_network(k_str, strict=False)
                                 if (net, t_str) not in cidr_rules:
                                     cidr_rules.append((net, t_str))
                             except ValueError:
@@ -360,6 +359,21 @@ def resolve_node_by_target(target: str, nodes: list, default_name: str = None) -
     target_clean = str(target).strip()
     target_lower = target_clean.lower()
 
+    # 0. 支持逗号分隔的多目标/节点容灾池定义 (如 "节点A, 节点B")，依次寻找首个未冷却的有效节点
+    # 注意：不能使用 '|' 作为候选分隔符，因为许多节点名称本身包含 '|' 属性说明
+    if "," in target_clean:
+        sub_targets = [st.strip() for st in target_clean.split(",") if st.strip()]
+        first_valid = None
+        for st in sub_targets:
+            res = resolve_node_by_target(st, nodes, None)
+            if res:
+                if not first_valid:
+                    first_valid = res
+                if not is_node_in_cooldown(res):
+                    return res
+        if first_valid:
+            return first_valid
+
     # 1. 精确完全匹配节点名称
     for n in nodes:
         if n.name.strip().lower() == target_lower:
@@ -379,9 +393,16 @@ def resolve_node_by_target(target: str, nodes: list, default_name: str = None) -
 
     # 3. 关键词特征加权评分匹配
     tokens = [t.lower() for t in re.findall(r'[\u4e00-\u9fa5]+|[a-zA-Z]+|\d+(?:\.\d+)?(?:倍)?', target_clean)]
+    SHORT_CODES = {"us", "de", "jp", "hk", "tw", "kr", "uk", "sg"}
+
+    def _match_kw(kw: str, text: str) -> bool:
+        if kw in SHORT_CODES:
+            return bool(re.search(rf"(^|[^a-z0-9]){re.escape(kw)}([^a-z0-9]|$)", text))
+        return kw in text
+
     extra_kws = []
     for reg, kws in REGION_KEYWORDS.items():
-        if reg in target_clean or any(k in target_lower for k in kws):
+        if reg in target_clean or any(_match_kw(k.lower(), target_lower) for k in kws):
             extra_kws.extend(kws)
             break
 
@@ -391,7 +412,7 @@ def resolve_node_by_target(target: str, nodes: list, default_name: str = None) -
         n_low = n.name.lower()
         score = 0
         for tok in tokens:
-            if tok in n_low:
+            if _match_kw(tok, n_low):
                 if any(char.isdigit() for char in tok):
                     score += 5  # 数字编号（如 01, 06）高权重
                 elif tok in ("0.1倍", "0.01倍", "倍"):
@@ -399,7 +420,7 @@ def resolve_node_by_target(target: str, nodes: list, default_name: str = None) -
                 else:
                     score += 3
         for ek in extra_kws:
-            if ek.lower() in n_low:
+            if _match_kw(ek.lower(), n_low):
                 score += 4
                 break
         if score > best_score:
@@ -409,12 +430,144 @@ def resolve_node_by_target(target: str, nodes: list, default_name: str = None) -
     if best_score > 0 and best_node:
         return best_node
 
-    # 4. 降级：模糊子串包含
-    for n in nodes:
-        if target_lower in n.name.lower() or n.name.lower() in target_lower:
-            return n.name
+    # 4. 降级：模糊子串包含 (仅对非 2 字母短代码允许降级)
+    if len(target_lower) > 2:
+        for n in nodes:
+            if target_lower in n.name.lower() or n.name.lower() in target_lower:
+                return n.name
 
     return default_name
+
+
+# ---- 节点故障临时熔断冷却池 (内存级) ----
+_NODE_FAIL_COOLDOWN = {}   # {node_name: (fail_timestamp, fail_count)}
+_NODE_FAIL_LOCK = threading.Lock()
+NODE_COOLDOWN_SECONDS = 30.0    # 首次失败冷却 30 秒，期间自动降权后移
+NODE_COOLDOWN_MAX_SECONDS = 600.0  # 连续失败指数升级，封顶 10 分钟
+
+def mark_node_failed(node_name: str):
+    """标记节点故障，进入短暂冷却；冷却窗口内连续失败则指数升级冷却时长 (快速熔断区域性故障)"""
+    if not node_name:
+        return
+    with _NODE_FAIL_LOCK:
+        ts, cnt = _NODE_FAIL_COOLDOWN.get(node_name, (0.0, 0))
+        cnt = cnt + 1 if (time.time() - ts) < NODE_COOLDOWN_SECONDS else 1
+        _NODE_FAIL_COOLDOWN[node_name] = (time.time(), cnt)
+
+def mark_node_ok(node_name: str):
+    """节点连接成功，清除冷却标记与失败计数"""
+    if not node_name:
+        return
+    with _NODE_FAIL_LOCK:
+        _NODE_FAIL_COOLDOWN.pop(node_name, None)
+
+def _node_cooldown_seconds(cnt: int) -> float:
+    return min(NODE_COOLDOWN_SECONDS * (2 ** max(0, cnt - 1)), NODE_COOLDOWN_MAX_SECONDS)
+
+def is_node_in_cooldown(node_name: str) -> bool:
+    """检查节点是否在冷却期内"""
+    if not node_name:
+        return False
+    with _NODE_FAIL_LOCK:
+        item = _NODE_FAIL_COOLDOWN.get(node_name)
+        if not item:
+            return False
+        ts, cnt = item
+        if time.time() - ts < _node_cooldown_seconds(cnt):
+            return True
+        del _NODE_FAIL_COOLDOWN[node_name]
+        return False
+
+
+def _match_node_region(name: str) -> str:
+    """从节点名提取地区。短代码仅按词边界匹配，避免 node/plus 等误伤。"""
+    if not name:
+        return ""
+    n = name.lower()
+    # (地区, 可安全子串, 需词边界的短代码)
+    rules = [
+        ("美国", ["美国", "usa", "🇺🇸"], ["us"]),
+        ("新加坡", ["新加坡", "singapore", "🇸🇬"], ["sg"]),
+        ("日本", ["日本", "japan", "🇯🇵"], ["jp"]),
+        ("香港", ["香港", "hong kong", "🇭🇰"], ["hk"]),
+        ("台湾", ["台湾", "taiwan", "🇹🇼"], ["tw"]),
+        ("韩国", ["韩国", "korea", "🇰🇷"], ["kr"]),
+        ("英国", ["英国", "🇬🇧"], ["uk"]),
+        ("德国", ["德国", "germany", "🇩🇪"], ["de"]),
+    ]
+    for region, tokens, codes in rules:
+        for t in tokens:
+            if t.lower() in n:
+                return region
+        for code in codes:
+            if re.search(rf"(^|[^a-z0-9]){re.escape(code)}([^a-z0-9]|$)", n):
+                return region
+    return ""
+
+
+def get_backup_candidates(failed_node_names: set or list) -> list:
+    """
+    根据已失败的节点集合，按智能优先级返回所有健康的备选代理节点列表。
+    优先级排序策略：
+    1. 同地区未冷却的稳定节点（优先 0.01倍/0.1倍）
+    2. 同地区其他未冷却节点
+    3. 同地区冷却中的节点（若无其它可选）
+    4. 全局其它地区未冷却节点
+    5. 全局其它地区冷却节点
+    """
+    if not g_cfg or not g_cfg.nodes:
+        return []
+
+    if isinstance(failed_node_names, str):
+        failed_set = {failed_node_names.strip().lower()}
+    else:
+        failed_set = {str(n).strip().lower() for n in failed_node_names if n}
+
+    failed_regions = {r for r in (_match_node_region(fname) for fname in failed_set) if r}
+
+    same_reg_active_hi = []
+    same_reg_active_lo = []
+    same_reg_cooldown = []
+    other_active_hi = []
+    other_active_lo = []
+    other_cooldown = []
+
+    for n in g_cfg.nodes:
+        n_low = n.name.lower().strip()
+        if n_low in failed_set:
+            continue
+        is_same_reg = bool(failed_regions) and _match_node_region(n.name) in failed_regions
+        in_cool = is_node_in_cooldown(n.name)
+        is_hi = bool(n.ws and ("0.01倍" in n.name or "0.1倍" in n.name))
+
+        if is_same_reg:
+            if in_cool:
+                same_reg_cooldown.append(n.name)
+            elif is_hi:
+                same_reg_active_hi.append(n.name)
+            else:
+                same_reg_active_lo.append(n.name)
+        else:
+            if in_cool:
+                other_cooldown.append(n.name)
+            elif is_hi:
+                other_active_hi.append(n.name)
+            else:
+                other_active_lo.append(n.name)
+
+    # 健康节点优先；冷却节点仅作为最后手段。
+    # 否则区域性故障 (如整区 503) 会把 max_backup_tries 全部耗在同区死节点上，
+    # 永远轮不到其它健康地区的节点。
+    active = same_reg_active_hi + same_reg_active_lo + other_active_hi + other_active_lo
+    cooldown = same_reg_cooldown + other_cooldown
+    return active + cooldown if active else cooldown
+
+
+def find_backup_proxy_node(failed_node_name: str) -> str:
+    """寻找单个最佳备选节点（保持向后兼容）"""
+    cands = get_backup_candidates([failed_node_name])
+    return cands[0] if cands else None
+
 
 
 # ---- 配置加载 ----
@@ -483,13 +636,13 @@ def load_config(path: str) -> bool:
                     ip_str = parts[1].strip()
                     target = parts[2].strip()
                     try:
-                        cidr = ipaddress.IPv4Network(ip_str, strict=False)
+                        cidr = ipaddress.ip_network(ip_str, strict=False)
                         new_cfg.route_cidrs.append((cidr, target))
                     except ValueError:
                         pass
                 elif cmd == "direct-ip" and len(parts) >= 2:
                     try:
-                        cidr = ipaddress.IPv4Network(parts[1].strip(), strict=False)
+                        cidr = ipaddress.ip_network(parts[1].strip(), strict=False)
                         new_cfg.direct_cidrs.append(cidr)
                     except ValueError:
                         pass
@@ -510,13 +663,13 @@ def load_config(path: str) -> bool:
     if new_cfg.node_count == 0 and new_cfg.default_proxy:
         return False
 
-    # 加载 Override-Configuration.json 自定义配置（优先级最高）
+    # 加载 Override-Configuration.json 自定义配置（作为未在 core.conf 中显式覆盖时的补充规则）
     override_dir = os.path.dirname(os.path.abspath(path)) if path else g_data_dir
     dom_overrides, cidr_overrides = load_override_rules(override_dir)
     if dom_overrides:
-        new_cfg.route_domains = dom_overrides + new_cfg.route_domains
+        new_cfg.route_domains = new_cfg.route_domains + dom_overrides
     if cidr_overrides:
-        new_cfg.route_cidrs = cidr_overrides + new_cfg.route_cidrs
+        new_cfg.route_cidrs = new_cfg.route_cidrs + cidr_overrides
 
     # 尽量保留旧配置选中的节点
     if g_cfg and g_cfg.nodes and 0 <= g_cfg.current_node < len(g_cfg.nodes):
@@ -558,11 +711,12 @@ def match_domains(host: str, domain_list: list) -> bool:
 def match_cidrs(host: str) -> bool:
     """匹配 CIDR 列表"""
     try:
-        ip = ipaddress.IPv4Address(host)
+        clean = host.strip("[]").split("%")[0]
+        ip = ipaddress.ip_address(clean)
         for cidr in g_cfg.direct_cidrs:
             if ip in cidr:
                 return True
-    except ValueError:
+    except (ValueError, TypeError):
         pass
     return False
 
@@ -624,12 +778,53 @@ def add_dynamic_direct(host: str):
             core_log(f"[FALLBACK] host {h} added to dynamic direct whitelist")
 
 
+# ---- Fake-IP 识别与反查 ----
+FAKE_V4_NET_STR = "198.18.0.0/15"   # TUN Fake-IPv4 网段 (与 aether_tun.py 一致)
+FAKE_V6_NET_STR = "fdfe:dcba:9877::/48"
+
+
+def _is_fake_ip(host: str) -> bool:
+    """判断地址是否落在 TUN Fake-IP 网段 (回流防护)"""
+    try:
+        clean = host.strip("[]").split("%")[0]
+        if ":" not in clean:
+            return ipaddress.IPv4Address(clean) in ipaddress.IPv4Network(FAKE_V4_NET_STR)
+        return ipaddress.IPv6Address(clean) in ipaddress.IPv6Network(FAKE_V6_NET_STR)
+    except Exception:
+        return False
+
+
+def unwrap_fake_ip(host: str) -> str:
+    """若目标为 Fake-IP (IPv4 198.18.0.0/15 或 IPv6 fdfe:dcba:9877::/48)，反查恢复为真实域名"""
+    if not host:
+        return host
+    clean = clean_host(host)
+    if _is_fake_ip(clean):
+        pool = getattr(sys, "_aether_fake_ip_pool", None)
+        if pool is not None:
+            dom = pool.reverse(clean)
+            if dom:
+                return dom
+        try:
+            try:
+                from core.tun_dns import reverse_fake_ip
+            except ImportError:
+                from tun_dns import reverse_fake_ip
+            real_dom = reverse_fake_ip(clean)
+            if real_dom:
+                return real_dom
+        except Exception:
+            pass
+    return host
+
+
 # ---- 规则决策 ----
 def decide_route(host: str, port: int, proc_name: str = None) -> tuple:
     """
     路由决策
     返回 (is_proxy: bool, node_name: str or None)
     """
+    host = unwrap_fake_ip(host)
     h_clean = clean_host(host)
     default_node = g_cfg.nodes[g_cfg.current_node].name if (g_cfg.nodes and 0 <= g_cfg.current_node < len(g_cfg.nodes)) else None
 
@@ -670,7 +865,7 @@ def decide_route(host: str, port: int, proc_name: str = None) -> tuple:
     # 2. 最高优先级：自定义覆盖配置规则 (Override-Configuration.json) 与专有路由
     if is_ip_str(host):
         try:
-            ip_obj = ipaddress.IPv4Address(h_clean.strip("[]"))
+            ip_obj = ipaddress.ip_address(h_clean.strip("[]").split("%")[0])
             for net, target in g_cfg.route_cidrs:
                 if ip_obj in net:
                     matched_node = resolve_node_by_target(target, g_cfg.nodes, default_node)
@@ -684,15 +879,7 @@ def decide_route(host: str, port: int, proc_name: str = None) -> tuple:
                 matched_node = resolve_node_by_target(target, g_cfg.nodes, default_node)
                 return True, matched_node
 
-    # 3. 检查自愈动态直连缓存
-    with g_dynamic_lock:
-        if h_clean in g_dynamic_direct:
-            return False, None
-        for d in g_dynamic_direct:
-            if domain_suffix_match(h_clean, d):
-                return False, None
-
-    # 4. 进程强制指定节点（未命中自定义域名规则时的降级）
+    # 3. 进程强制指定节点（未命中自定义域名规则时的降级）
     if proc_forced_node:
         return True, proc_forced_node
 
@@ -707,7 +894,10 @@ def decide_route(host: str, port: int, proc_name: str = None) -> tuple:
         if match_cidrs(host):
             return False, None
         try:
-            from core.aether_geoip import is_cn
+            try:
+                from core.aether_geoip import is_cn
+            except ImportError:
+                from aether_geoip import is_cn
             if is_cn(host, g_data_dir):
                 return False, None
         except Exception:
@@ -737,13 +927,14 @@ def vless_build_header(node: Node, host: str, port: int) -> bytes:
     buf.append(port & 0xFF)
 
     # Address type
+    h_clean = host.strip("[]").split("%")[0]
     try:
-        ip = ipaddress.IPv4Address(host)
+        ip = ipaddress.IPv4Address(h_clean)
         buf.append(1)  # IPv4
         buf.extend(ip.packed)
     except ValueError:
         try:
-            ip = ipaddress.IPv6Address(host)
+            ip = ipaddress.IPv6Address(h_clean)
             buf.append(3)  # IPv6
             buf.extend(ip.packed)
         except ValueError:
@@ -759,20 +950,6 @@ def vless_build_header(node: Node, host: str, port: int) -> bytes:
 
 
 # ---- 出站连接 ----
-FAKE_V4_NET_STR = "198.18.0.0/15"   # TUN Fake-IPv4 网段 (与 aether_tun.py 一致)
-FAKE_V6_NET_STR = "fdfe:dcba:9877::/48"
-
-
-def _is_fake_ip(host: str) -> bool:
-    """判断地址是否落在 TUN Fake-IP 网段 (回流防护)"""
-    try:
-        if ":" not in host:
-            return ipaddress.IPv4Address(host) in ipaddress.IPv4Network(FAKE_V4_NET_STR)
-        return ipaddress.IPv6Address(host) in ipaddress.IPv6Network(FAKE_V6_NET_STR)
-    except Exception:
-        return False
-
-
 def _tun_dns_resolve(host: str) -> str:
     """TUN 模式下的直连域名解析: 经物理网卡向上游 UDP DNS 查询 A 记录。
 
@@ -780,43 +957,67 @@ def _tun_dns_resolve(host: str) -> str:
     返回 198.18.x.x 导致直连目标回流 TUN 形成循环。失败返回 None。
     """
     bind_ip = os.environ.get("AETHER_BIND_IP")
-    upstream = os.environ.get("AETHER_DNS_UPSTREAM", "223.5.5.5")
-    try:
-        txid = random.getrandbits(16)
-        qname = b"".join(bytes([len(l)]) + l.encode() for l in host.split(".")) + b"\x00"
-        query = struct.pack(">HHHHHH", txid, 0x0100, 1, 0, 0, 0) + qname + struct.pack(">HH", 1, 1)
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(2.0)
-        if bind_ip:
-            s.bind((bind_ip, 0))
-        s.sendto(query, (upstream, 53))
-        data, _ = s.recvfrom(4096)
-        s.close()
-        if len(data) < 12 or struct.unpack(">H", data[:2])[0] != txid:
-            return None
-        ancount = struct.unpack(">H", data[6:8])[0]
-        # 跳过 Question
-        off = 12
-        while off < len(data) and data[off] != 0:
-            off += 1 + data[off]
-        off += 5
-        # 解析 Answer 中的 A 记录
-        for _ in range(ancount):
-            if off >= len(data):
-                break
-            if data[off] & 0xC0 == 0xC0:
-                off += 2
-            else:
-                while off < len(data) and data[off] != 0:
-                    off += 1 + data[off]
-                off += 1
-            atype, _aclass, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
-            off += 10
-            if atype == 1 and rdlen == 4:
-                return socket.inet_ntoa(data[off:off + 4])
-            off += rdlen
-    except Exception:
-        pass
+    if not bind_ip:
+        try:
+            try:
+                from core.aether_tun import detect_physical_network
+            except ImportError:
+                from aether_tun import detect_physical_network
+            phys = detect_physical_network()
+            bind_ip = phys.get("v4_ip")
+        except Exception:
+            pass
+
+    upstreams = [os.environ.get("AETHER_DNS_UPSTREAM", "223.5.5.5"), "119.29.29.29", "114.114.114.114"]
+    for upstream in upstreams:
+        s = None
+        try:
+            txid = random.getrandbits(16)
+            qname = b"".join(bytes([len(l)]) + (l.encode("idna") if not l.isascii() else l.encode()) for l in host.split(".")) + b"\x00"
+            query = struct.pack(">HHHHHH", txid, 0x0100, 1, 0, 0, 0) + qname + struct.pack(">HH", 1, 1)
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(1.5)
+            if bind_ip:
+                try:
+                    s.bind((bind_ip, 0))
+                except OSError:
+                    pass
+            s.sendto(query, (upstream, 53))
+            data, _ = s.recvfrom(4096)
+            if len(data) < 12 or struct.unpack(">H", data[:2])[0] != txid:
+                continue
+            ancount = struct.unpack(">H", data[6:8])[0]
+            try:
+                from tun_dns import skip_dns_question, _decode_qname
+            except ImportError:
+                from core.tun_dns import skip_dns_question, _decode_qname
+            off = skip_dns_question(data, 12)
+            if off < 0:
+                continue
+            # 解析 Answer 中的 A 记录
+            for _ in range(ancount):
+                if off >= len(data):
+                    break
+                _, off = _decode_qname(data, off)
+                if off + 10 > len(data):
+                    break
+                atype, _aclass, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+                off += 10
+                if off + rdlen > len(data):
+                    break
+                if atype == 1 and rdlen == 4:
+                    res_ip = socket.inet_ntoa(data[off:off + 4])
+                    if not _is_fake_ip(res_ip):
+                        return res_ip
+                off += rdlen
+        except Exception:
+            pass
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
     return None
 
 
@@ -829,9 +1030,17 @@ def dial_host(host: str, port: int, timeout: float = HANDSHAKE_TIMEOUT) -> socke
     bind_ip6 = os.environ.get("AETHER_BIND_IP6")
     tun_mode = os.environ.get("AETHER_TUN") == "1"
 
+    if tun_mode and not _is_ip_literal(host):
+        resolved = _tun_dns_resolve(host)
+        if resolved and not _is_fake_ip(resolved):
+            host = resolved
+        else:
+            raise ConnectionError(f"TUN DNS resolve failed for {host}")
+
     is_v6 = ":" in host
     fam = socket.AF_INET6 if is_v6 else socket.AF_INET
 
+    s = None
     try:
         s = socket.socket(fam, socket.SOCK_STREAM)
         s.settimeout(timeout)
@@ -846,10 +1055,6 @@ def dial_host(host: str, port: int, timeout: float = HANDSHAKE_TIMEOUT) -> socke
                     import errno
                     raise OSError(errno.ENETUNREACH, f"IPv6 unreachable: physical uplink has no IPv6 for {host}")
             elif bind_ip:
-                if not _is_ip_literal(host):
-                    resolved = _tun_dns_resolve(host)
-                    if resolved:
-                        host = resolved
                 try:
                     s.bind((bind_ip, 0))
                 except OSError:
@@ -858,12 +1063,17 @@ def dial_host(host: str, port: int, timeout: float = HANDSHAKE_TIMEOUT) -> socke
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         return s
     except Exception:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
         raise
 
 
 def _is_ip_literal(host: str) -> bool:
     try:
-        ipaddress.IPv4Address(host)
+        ipaddress.ip_address(host.strip("[]").split("%")[0])
         return True
     except Exception:
         return False
@@ -1091,7 +1301,8 @@ def _ws_handshake(sock: socket.socket, path: str, host: str) -> tuple:
     headers = resp[:idx]
     leftover = resp[idx + 4:]
 
-    if b"101" in headers:
+    status_line = headers.split(b"\r\n")[0].strip() if headers else b""
+    if re.match(rb"^HTTP/1\.[01]\s+101(\s|$)", status_line):
         return True, leftover
     else:
         first_line = headers.split(b"\r\n")[0].decode("ascii", errors="replace") if headers else "empty"
@@ -1102,6 +1313,7 @@ def _ws_handshake(sock: socket.socket, path: str, host: str) -> tuple:
 # ---- 节点连接 ----
 def node_open(host: str, port: int, node_name: str = None) -> Chan:
     """建立到 VLESS 节点的通道"""
+    host = unwrap_fake_ip(host)
     idx = g_cfg.current_node
     if node_name:
         for i, n in enumerate(g_cfg.nodes):
@@ -1113,39 +1325,112 @@ def node_open(host: str, port: int, node_name: str = None) -> Chan:
         raise ValueError("no node configured")
 
     node = g_cfg.nodes[idx]
-    sock = dial_host(node.server, node.port)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-    ch = Chan(sock)
-
-    if node.tls:
-        ssock = _tls_handshake(sock, node.sni)
-        ch = Chan(ssock)
-        ch.tls = True
-
-    if node.ws:
-        ok, leftover = _ws_handshake(ch.sock, node.ws_path, node.ws_host)
-        if not ok:
-            ch.close()
-            raise ConnectionError("WebSocket handshake failed")
-        ch.ws = True
-        if leftover:
-            ch.in_buffer.extend(leftover)
-
-    # 标记为 VLESS 节点，启用 2 字节响应头自动剥离
-    ch.vless = True
-
-    # 发送 VLESS 头
-    vh = vless_build_header(node, host, port)
-    ch.send(vh)
-
-    # 握手完成，将 socket 切换为长连接保活模式
+    server_target = node.server
+    if not _is_ip_literal(server_target):
+        real_server = _tun_dns_resolve(server_target)
+        if real_server and not _is_fake_ip(real_server):
+            server_target = real_server
+        elif os.environ.get("AETHER_TUN") == "1":
+            raise ConnectionError(f"TUN DNS resolve failed for node server {server_target}")
+    sock = None
+    ch = None
     try:
-        ch.sock.settimeout(120.0)
-    except Exception:
-        pass
+        sock = dial_host(server_target, node.port)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    return ch
+        ch = Chan(sock)
+
+        if node.tls:
+            ssock = _tls_handshake(sock, node.sni)
+            ch = Chan(ssock)
+            ch.tls = True
+
+        if node.ws:
+            ok, leftover = _ws_handshake(ch.sock, node.ws_path, node.ws_host)
+            if not ok:
+                ch.close()
+                raise ConnectionError("WebSocket handshake failed")
+            ch.ws = True
+            if leftover:
+                ch.in_buffer.extend(leftover)
+
+        # 标记为 VLESS 节点，启用 2 字节响应头自动剥离
+        ch.vless = True
+
+        # 发送 VLESS 头
+        vh = vless_build_header(node, host, port)
+        ch.send(vh)
+
+        # 握手完成，将 socket 切换为长连接保活模式
+        try:
+            ch.sock.settimeout(120.0)
+        except Exception:
+            pass
+
+        return ch
+    except Exception:
+        if ch is not None:
+            ch.close()
+        elif sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        raise
+
+
+def connect_proxy_with_failover(host: str, port: int, primary_node: str = None, proc_name: str = "", max_backup_tries: int = 2) -> tuple:
+    """
+    多节点容灾连接池：
+    先连接指定的 primary_node（支持重试 1 次），若失败则自动打上短暂熔断冷却标记，
+    并自动从候选容灾池中提取健康的同地区备选节点依次尝试切换连接。
+    返回 (ch: Chan, used_node_name: str)
+    若所有备选节点全部失败，则向上层抛出异常，绝不降级直连。
+    """
+    tried_nodes = set()
+    first_err = None
+
+    # 1. 尝试主节点 (冷却期内直接跳过，避免每个连接都先白等一次已知故障节点)
+    if primary_node:
+        tried_nodes.add(primary_node.strip().lower())
+        if is_node_in_cooldown(primary_node):
+            core_log(f"[FAILOVER] ({proc_name}) {host}:{port} primary node [{primary_node}] in cooldown, skip to backup pool")
+        else:
+            try:
+                ch = node_open_retry(host, port, primary_node, attempts=1)
+                mark_node_ok(primary_node)
+                return ch, primary_node
+            except Exception as e:
+                first_err = e
+                mark_node_failed(primary_node)
+                core_log(f"[FAIL] ({proc_name}) {host}:{port} primary node [{primary_node}] failed: {e}")
+
+    # 2. 从多节点容灾池依次尝试健康备选节点
+    candidates = get_backup_candidates(tried_nodes)
+    if not candidates and not primary_node:
+        # 如果未指定 primary_node，直接取第一个候选
+        candidates = get_backup_candidates([])
+
+    backup_tries = 0
+    last_err = first_err
+    for cand in candidates:
+        if backup_tries >= max_backup_tries:
+            break
+        tried_nodes.add(cand.strip().lower())
+        backup_tries += 1
+        core_log(f"[FAILOVER] ({proc_name}) {host}:{port} failover to backup node [{cand}] (attempt {backup_tries}/{max_backup_tries})")
+        try:
+            ch = node_open_retry(host, port, cand, attempts=1)
+            mark_node_ok(cand)
+            return ch, cand
+        except Exception as e_cand:
+            last_err = e_cand
+            mark_node_failed(cand)
+            core_log(f"[FAIL] ({proc_name}) {host}:{port} backup node [{cand}] failed: {e_cand}")
+
+    if last_err:
+        raise last_err
+    raise ConnectionError(f"all proxy nodes failed for {host}:{port}")
 
 
 def node_open_retry(host: str, port: int, node_name: str = None, attempts: int = 2) -> Chan:
@@ -1164,6 +1449,7 @@ def node_open_retry(host: str, port: int, node_name: str = None, attempts: int =
 # ---- 直连通道 ----
 def chan_outbound(host: str, port: int) -> Chan:
     """建立直连通道"""
+    host = unwrap_fake_ip(host)
     sock = dial_host(host, port)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     return Chan(sock)
@@ -1273,29 +1559,23 @@ def relay_tunnel(client: socket.socket, ch: Chan, is_up: bool = True, timeout: f
 
 
 def _report_relay_result(proc_name: str, host: str, port: int, use_proxy: bool, bytes_up: int, bytes_down: int, err: str = None):
-    """统一分析并汇报中继结果，精准捕获 ERR_CONNECTION_CLOSED 与 ERR_TIMED_OUT 并自动切换直连"""
+    """统一分析并汇报中继结果，准确记录超时与断开日志（取消降级直连）"""
     is_timeout = bool(err and "timed out" in str(err).lower())
 
     if is_timeout:
         if use_proxy:
             core_log(f"[TIMEOUT] ({proc_name}) {host}:{port} proxy response timed out (ERR_TIMED_OUT)")
-            add_dynamic_direct(host)
-            core_log(f"[FALLBACK] ({proc_name}) {host}:{port} auto-fallback to DIRECT")
         else:
             core_log(f"[TIMEOUT] ({proc_name}) {host}:{port} direct connection timed out (ERR_TIMED_OUT)")
     elif bytes_up > 0 and bytes_down == 0:
         if use_proxy:
             core_log(f"[CLOSED] ({proc_name}) {host}:{port} proxy terminated by remote (ERR_CONNECTION_CLOSED)")
-            add_dynamic_direct(host)
-            core_log(f"[FALLBACK] ({proc_name}) {host}:{port} auto-fallback to DIRECT")
         else:
             core_log(f"[CLOSED] ({proc_name}) {host}:{port} direct terminated by remote")
     elif bytes_up == 0 and bytes_down == 0:
         # 空连接提前掐断或等待首包超时
         if use_proxy:
             core_log(f"[TIMEOUT] ({proc_name}) {host}:{port} connection closed with 0B (ERR_TIMED_OUT)")
-            add_dynamic_direct(host)
-            core_log(f"[FALLBACK] ({proc_name}) {host}:{port} auto-fallback to DIRECT")
         else:
             core_log(f"[CLOSED] ({proc_name}) {host}:{port} direct closed with 0B")
     else:
@@ -1356,6 +1636,7 @@ def handle_socks5(client: socket.socket, client_ip: str, client_port: int = 0):
             return
         port = (portb[0] << 8) | portb[1]
 
+        host = unwrap_fake_ip(host)
         tun_proc = get_tun_client_process(client_port) if client_port else ""
         proc_name = tun_proc or (get_process_for_port(client_port) if client_port else "")
         use_proxy, node_name = decide_route(host, port, proc_name)
@@ -1364,20 +1645,15 @@ def handle_socks5(client: socket.socket, client_ip: str, client_port: int = 0):
         ch = None
         if use_proxy and g_cfg.node_count > 0:
             try:
-                ch = node_open_retry(host, port, node_name)
+                ch, used_node = connect_proxy_with_failover(host, port, primary_node=node_name, proc_name=proc_name)
+                node_name = used_node
             except Exception as e:
-                core_log(f"[FAIL] ({proc_name}) {host}:{port} proxy connect failed: {e}")
-                core_log(f"[FALLBACK] ({proc_name}) {host}:{port} auto-fallback to DIRECT")
-                add_dynamic_direct(host)
+                core_log(f"[FAIL] ({proc_name}) {host}:{port} all proxy failovers exhausted: {e}")
                 try:
-                    ch = chan_outbound_retry(host, port)
-                    use_proxy = False
-                except Exception as e2:
-                    try:
-                        client.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
-                    except Exception:
-                        pass
-                    raise e2
+                    client.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
+                except Exception:
+                    pass
+                raise e
         else:
             try:
                 ch = chan_outbound_retry(host, port)
@@ -1396,8 +1672,14 @@ def handle_socks5(client: socket.socket, client_ip: str, client_port: int = 0):
         ch.close()
         _report_relay_result(proc_name, host, port, use_proxy, bytes_up, bytes_down, err)
     except Exception as e:
-        core_log(f"[x] SOCKS5 error: {e}")
+        import traceback
+        core_log(f"[x] SOCKS5 error: {e} | {traceback.format_exc(limit=6)}")
     finally:
+        if ch is not None:
+            try:
+                ch.close()
+            except Exception:
+                pass
         try:
             client.close()
         except Exception:
@@ -1447,26 +1729,22 @@ def handle_http(client: socket.socket, client_ip: str, first_byte: bytes, client
                 host = target
                 port = 443
 
+            host = unwrap_fake_ip(host)
             use_proxy, node_name = decide_route(host, port, proc_name)
             log_conn("TCP", client_ip, client_port, host, port, use_proxy, node_name, proc_name)
 
             ch = None
             if use_proxy and g_cfg.node_count > 0:
                 try:
-                    ch = node_open_retry(host, port, node_name)
+                    ch, used_node = connect_proxy_with_failover(host, port, primary_node=node_name, proc_name=proc_name)
+                    node_name = used_node
                 except Exception as e:
-                    core_log(f"[FAIL] ({proc_name}) {host}:{port} proxy connect failed: {e}")
-                    core_log(f"[FALLBACK] ({proc_name}) {host}:{port} auto-fallback to DIRECT")
-                    add_dynamic_direct(host)
+                    core_log(f"[FAIL] ({proc_name}) {host}:{port} all proxy failovers exhausted: {e}")
                     try:
-                        ch = chan_outbound_retry(host, port)
-                        use_proxy = False
-                    except Exception as e2:
-                        try:
-                            client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                        except Exception:
-                            pass
-                        raise e2
+                        client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                    except Exception:
+                        pass
+                    raise e
             else:
                 try:
                     ch = chan_outbound_retry(host, port)
@@ -1495,23 +1773,19 @@ def handle_http(client: socket.socket, client_ip: str, first_byte: bytes, client
                 client.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
                 return
 
+            host = unwrap_fake_ip(host)
             use_proxy, node_name = decide_route(host, port, proc_name)
             log_conn(method, client_ip, client_port, host, port, use_proxy, node_name, proc_name)
 
             ch = None
             if use_proxy and g_cfg.node_count > 0:
                 try:
-                    ch = node_open_retry(host, port, node_name)
+                    ch, used_node = connect_proxy_with_failover(host, port, primary_node=node_name, proc_name=proc_name)
+                    node_name = used_node
                 except Exception as e:
-                    core_log(f"[FAIL] ({proc_name}) {host}:{port} proxy connect failed: {e}")
-                    core_log(f"[FALLBACK] ({proc_name}) {host}:{port} auto-fallback to DIRECT")
-                    add_dynamic_direct(host)
-                    try:
-                        ch = chan_outbound_retry(host, port)
-                        use_proxy = False
-                    except Exception as e2:
-                        client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                        return
+                    core_log(f"[FAIL] ({proc_name}) {host}:{port} all proxy failovers exhausted: {e}")
+                    client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                    return
             else:
                 try:
                     ch = chan_outbound_retry(host, port)
@@ -1536,6 +1810,11 @@ def handle_http(client: socket.socket, client_ip: str, first_byte: bytes, client
     except Exception as e:
         core_log(f"[x] HTTP error: {e}")
     finally:
+        if ch is not None:
+            try:
+                ch.close()
+            except Exception:
+                pass
         try:
             client.close()
         except Exception:
@@ -1774,9 +2053,9 @@ def handle_controller(client: socket.socket):
                           json.dumps({"error": "failed to reload config"}))
         elif method == "PUT" and path.startswith("/proxies/"):
             # 解析 body 中的 {"name": "..."}
-            body = req.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in req else ""
+            body_text = body.strip() or (req.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in req else "")
             try:
-                data = json.loads(body)
+                data = json.loads(body_text)
                 name = data.get("name", "")
                 if name and ctrl_set_node(name):
                     ctrl_send(client, "204 No Content", "application/json", "")

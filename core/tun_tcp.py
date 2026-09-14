@@ -171,41 +171,57 @@ def socks5_connect(socks_addr, dest, port, timeout=10.0, client_port: int = 0):
         except Exception:
             pass
 
-    s.sendall(b"\x05\x01\x00")
-    r = s.recv(2)
-    if len(r) < 2 or r[0] != 0x05 or r[1] != 0x00:
-        s.close()
-        raise ConnectionError("SOCKS5 握手失败")
+    def _recv_exact(sock, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("SOCKS5 连接过早关闭")
+            buf.extend(chunk)
+        return bytes(buf)
+
     try:
-        addr = socket.inet_aton(dest)
-        if dest.count(".") == 3:
-            atyp = 0x01
-        else:
-            raise OSError
-    except OSError:
+        s.sendall(b"\x05\x01\x00")
+        r = _recv_exact(s, 2)
+        if r[0] != 0x05 or r[1] != 0x00:
+            s.close()
+            raise ConnectionError("SOCKS5 握手失败")
         try:
-            addr = socket.inet_pton(socket.AF_INET6, dest)
-            atyp = 0x04
+            addr = socket.inet_aton(dest)
+            if dest.count(".") == 3:
+                atyp = 0x01
+            else:
+                raise OSError
         except OSError:
-            atyp = 0x03
-            addr = dest.encode("idna") if not dest.isascii() else dest.encode()
-    req = b"\x05\x01\x00" + bytes([atyp]) + (
-        bytes([len(addr)]) if atyp == 0x03 else b"") + addr + struct.pack(">H", port)
-    s.sendall(req)
-    r = s.recv(4)
-    if len(r) < 4 or r[1] != 0x00:
-        s.close()
-        raise ConnectionError(f"SOCKS5 CONNECT 失败: code={r[1] if len(r) > 1 else '?'}")
-    if r[3] == 0x01:
-        s.recv(6)
-    elif r[3] == 0x04:
-        s.recv(18)
-    elif r[3] == 0x03:
-        dl = s.recv(1)
-        if dl:
-            s.recv(dl[0] + 2)
-    s.settimeout(None)
-    return s
+            try:
+                addr = socket.inet_pton(socket.AF_INET6, dest)
+                atyp = 0x04
+            except OSError:
+                atyp = 0x03
+                addr = dest.encode("idna") if not dest.isascii() else dest.encode()
+        req = b"\x05\x01\x00" + bytes([atyp]) + (
+            bytes([len(addr)]) if atyp == 0x03 else b"") + addr + struct.pack(">H", port)
+        s.sendall(req)
+        r = _recv_exact(s, 4)
+        if r[1] != 0x00:
+            s.close()
+            raise ConnectionError(f"SOCKS5 CONNECT 失败: code={r[1]}")
+        if r[3] == 0x01:
+            _recv_exact(s, 6)
+        elif r[3] == 0x04:
+            _recv_exact(s, 18)
+        elif r[3] == 0x03:
+            dl = _recv_exact(s, 1)
+            if dl:
+                _recv_exact(s, dl[0] + 2)
+        s.settimeout(None)
+        return s
+    except Exception:
+        try:
+            s.close()
+        except Exception:
+            pass
+        raise
 
 
 class TCB:
@@ -234,6 +250,7 @@ class TCB:
         self.snd_nxt = (self.snd_iss + 1) & 0xFFFFFFFF
         self.snd_una = self.snd_iss
         self.snd_q = collections.deque()
+        self.snd_cond = threading.Condition(self.lock)
         self.unacked = []             # [seq, data, send_time, retries, is_fin]
         self.client_win = 0
         self.client_mss = MSS_V4 if family == 4 else MSS_V6
@@ -277,6 +294,10 @@ class TCB:
         self._try_send()
 
     def _accept_data_locked(self, seq, payload):
+        used = sum(len(d) for d in self.rcv_q) + self.ooo_bytes
+        if used >= RCV_BUF_CAP:
+            self._send_ack_locked()
+            return
         if seq == self.rcv_nxt:
             self.rcv_q.append(payload)
             self.rcv_nxt = (self.rcv_nxt + len(payload)) & 0xFFFFFFFF
@@ -289,6 +310,7 @@ class TCB:
             with self.rcv_cond:
                 self.rcv_cond.notify_all()
             self._send_ack_locked()
+            self._check_fin_locked()  # 乱序先到的 FIN 在数据补齐后才能确认
         elif seq_gt(seq, self.rcv_nxt) and self.ooo_bytes < 32768:
             self.ooo[seq] = payload
             self.ooo_bytes += len(payload)
@@ -320,13 +342,18 @@ class TCB:
         if seq_lte(ackn, self.snd_una) or seq_gt(ackn, self.snd_nxt):
             return
         self.snd_una = ackn
+        acked_any = False
         while self.unacked:
             e = self.unacked[0]
             end = (e[0] + len(e[1]) + (1 if e[4] else 0)) & 0xFFFFFFFF
             if seq_lte(end, ackn):
                 self.unacked.pop(0)
+                acked_any = True
             else:
                 break
+        if acked_any:
+            with self.snd_cond:
+                self.snd_cond.notify_all()
         # 我方 FIN 已被确认
         if self.fin_sent and self.snd_una == self.snd_nxt:
             if self.client_fin:
@@ -349,8 +376,11 @@ class TCB:
                 mss = min(self.client_mss, MSS_V4 if self.family == 4 else MSS_V6)
                 data = self.snd_q.popleft()
                 while data and inflight < win:
-                    chunk = data[:mss]
-                    data = data[mss:]
+                    max_len = min(mss, win - inflight)
+                    if max_len <= 0:
+                        break
+                    chunk = data[:max_len]
+                    data = data[max_len:]
                     self._emit_locked(chunk, False)
                     inflight += len(chunk)
                 if data:
@@ -373,7 +403,7 @@ class TCB:
 
     def _adv_window_locked(self):
         used = sum(len(d) for d in self.rcv_q) + self.ooo_bytes
-        return max(1, min(RCV_BUF_CAP - used, 0xFFFF))
+        return max(0, min(RCV_BUF_CAP - used, 0xFFFF))
 
     def _send_ack_locked(self):
         seg = build_tcp_segment(self.dst, self.src, self.dport, self.sport,
@@ -440,11 +470,26 @@ class TCB:
             except Exception:
                 self.rst()
                 return
+            with self.lock:
+                if not self.dead:
+                    self._send_ack_locked()  # 读走缓冲后通告窗口更新
+        try:
+            s.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
 
     def _pump_s2t(self, s):
-        """SOCKS5 下行 -> TUN 发送缓冲"""
+        """SOCKS5 下行 -> TUN 发送缓冲 (带背压)"""
         try:
             while True:
+                with self.lock:
+                    while not self.dead:
+                        snd_buffered = sum(len(d) for d in self.snd_q) + sum(len(e[1]) for e in self.unacked)
+                        if snd_buffered < INFLIGHT_CAP:
+                            break
+                        self.snd_cond.wait(0.5)
+                    if self.dead:
+                        return
                 data = s.recv(65536)
                 if not data:
                     break
@@ -480,6 +525,8 @@ class TCB:
             self.socks = None
         with self.rcv_cond:
             self.rcv_cond.notify_all()
+        with self.snd_cond:
+            self.snd_cond.notify_all()
         self.stack.remove_flow(self.src, self.sport, self.dst, self.dport)
 
     def on_timer(self, now):
@@ -593,13 +640,20 @@ class TcpStack:
         with self.lock:
             self.flows.pop((src, sport, dst, dport), None)
 
+    def on_timer_tick(self, now=None):
+        if now is None:
+            now = time.time()
+        with self.lock:
+            dead_keys = [k for k, t in self.flows.items() if t.dead or t.state == "CLOSED"]
+            for k in dead_keys:
+                self.flows.pop(k, None)
+            tcbs = list(self.flows.values())
+        for t in tcbs:
+            try:
+                t.on_timer(now)
+            except Exception:
+                pass
+
     def _timer_loop(self):
         while not self._stop.wait(0.2):
-            now = time.time()
-            with self.lock:
-                tcbs = list(self.flows.values())
-            for t in tcbs:
-                try:
-                    t.on_timer(now)
-                except Exception:
-                    pass
+            self.on_timer_tick()

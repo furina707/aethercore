@@ -20,6 +20,7 @@ except Exception:
 
 import json
 import base64
+import socket
 import urllib.request
 import urllib.parse
 import subprocess
@@ -27,7 +28,31 @@ import re
 import struct
 import ipaddress
 
-SUB_URL = "https://dasho.xn--cp3a08l.com/api/v1/pq/a238fdf4660b8a4ee19242b2adf655d9"
+DEFAULT_SUB_URL = "https://dasho.xn--cp3a08l.com/api/v1/pq/a238fdf4660b8a4ee19242b2adf655d9"
+SUB_URL = DEFAULT_SUB_URL
+
+def get_sub_url(data_dir: str = None) -> str:
+    """获取订阅链接：环境变量 AETHER_SUB_URL > data/sub_url.txt > 默认链接"""
+    env_url = os.environ.get("AETHER_SUB_URL", "").strip()
+    if env_url:
+        return env_url
+    candidates = []
+    if data_dir:
+        candidates.append(os.path.join(data_dir, "sub_url.txt"))
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(os.path.dirname(script_dir), "data", "sub_url.txt"))
+    candidates.append(os.path.join(os.getcwd(), "data", "sub_url.txt"))
+    for c in candidates:
+        if os.path.exists(c):
+            try:
+                with open(c, "r", encoding="utf-8") as f:
+                    u = f.read().strip()
+                    if u.startswith("http://") or u.startswith("https://"):
+                        return u
+            except Exception:
+                pass
+    return DEFAULT_SUB_URL
+
 MAX_NODES = 128
 
 # ---- 域名分流规则（与旧 subscription.py 保持一致） ----
@@ -163,6 +188,16 @@ def parse_proxies(content: str) -> list:
         if not (name and type_ and server and port_str):
             continue
 
+        if _kv_value(type_).lower() != "vless":
+            continue
+
+        # 过滤核心暂不支持的 reality / vision 协议节点，避免生成无效节点导致握手失败
+        if "reality-opts" in entry or "public-key" in entry:
+            continue
+        flow = _kv_get(entry, "flow")
+        if flow and "vision" in _kv_value(flow).lower():
+            continue
+
         try:
             port = int(port_str)
         except ValueError:
@@ -170,7 +205,7 @@ def parse_proxies(content: str) -> list:
 
         n = Node()
         n.name = _kv_value(name)
-        n.type = _kv_value(type_)
+        n.type = "vless"
         n.server = _kv_value(server)
         n.port = port
         if uuid:
@@ -323,15 +358,16 @@ def write_process_rules(f, rules_path: str):
         pass
 
 
-def fetch_subscription(cache_path: str) -> bool:
+def fetch_subscription(cache_path: str, data_dir: str = None) -> bool:
     """拉取订阅到缓存文件，优化连接超时与代理嗅探"""
+    sub_url = get_sub_url(data_dir or (os.path.dirname(cache_path) if cache_path else None))
     cmd = [
         "curl.exe", "-s", "-L",
         "--connect-timeout", "4",
         "-m", "10",
         "-A", "ClashMeta; AetherCore",
         "-o", cache_path,
-        SUB_URL,
+        sub_url,
     ]
     try:
         rc = subprocess.run(cmd, capture_output=True, timeout=12)
@@ -492,7 +528,7 @@ def generate(data_dir: str, mode: str = "auto") -> bool:
     content = None
     if mode != "rebuild":
         print("[*] 正在拉取订阅...")
-        if fetch_subscription(cache_path):
+        if fetch_subscription(cache_path, data_dir):
             print("[*] 订阅拉取成功")
         elif mode == "fetch":
             alt_path = os.path.join(data_dir, "config.yaml")

@@ -16,14 +16,24 @@ import struct
 import threading
 import time
 import subprocess
+import ipaddress
+import random
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aether_tun import (
     WintunDevice, detect_physical_network, is_fake_v4, is_fake_v6, is_fake_ip,
     TUN_V4_IP, TUN_V6_IP,
 )
-from tun_dns import FakeIPDNS
+from tun_dns import FakeIPDNS, skip_dns_question, _decode_qname
 from tun_tcp import TcpStack
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host.strip("[]").split("%")[0])
+        return True
+    except Exception:
+        return False
 
 IPPROTO_TCP = 6
 IPPROTO_UDP = 17
@@ -314,11 +324,20 @@ class TunEngine:
 
         # 节点服务器 /32 主机路由 (双保险: 即使绑定失效也直走物理网关)
         for server in self._node_servers():
-            if ":" not in server:
-                try:
-                    self.device.install_bypass_route_v4(server)
-                except Exception:
-                    pass
+            target_ips = set()
+            if _is_ip_literal(server):
+                target_ips.add(server)
+            else:
+                real_ip = self._resolve_server_ip(server)
+                if real_ip:
+                    target_ips.add(real_ip)
+            for ip in target_ips:
+                if ":" not in ip and not is_fake_ip(ip):
+                    try:
+                        self.device.install_bypass_route_v4(ip)
+                        self.log(f"[tun] 已为节点服务器 {server} ({ip}) 安装 /32 物理网关旁路路由")
+                    except Exception as e:
+                        self.log(f"[tun] 安装 /32 旁路路由异常 ({server}): {e}")
 
         if not self.device.install_capture_routes(with_v4=True, with_v6=has_v6):
             raise RuntimeError("接管路由安装失败")
@@ -394,6 +413,15 @@ class TunEngine:
             self.log(f"[tun-dns] 物理网卡 (ifIndex={phys_if}) DNS 已恢复")
         except Exception as e:
             self.log(f"[tun-dns] 恢复物理网卡 DNS 异常: {e}")
+            try:
+                if orig and len(orig) > 0:
+                    subprocess.run(["netsh", "interface", "ipv4", "set", "dnsservers", str(phys_if), "static", orig[0], "primary"],
+                                   capture_output=True, timeout=2, creationflags=flags)
+                else:
+                    subprocess.run(["netsh", "interface", "ipv4", "set", "dnsservers", str(phys_if), "dhcp"],
+                                   capture_output=True, timeout=2, creationflags=flags)
+            except Exception:
+                pass
 
     def stop(self):
         self._stop.set()
@@ -423,6 +451,56 @@ class TunEngine:
             except Exception:
                 pass
         return servers
+
+    def _resolve_server_ip(self, host: str) -> str:
+        """通过物理网卡绑定直接向上游 DNS 查询 A 记录，彻底避开系统 DNS / Fake-IP 污染"""
+        phys_ip = self.phys.get("v4_ip")
+        upstreams = ["223.5.5.5", "119.29.29.29", "114.114.114.114"]
+        for upstream in upstreams:
+            s = None
+            try:
+                txid = random.getrandbits(16)
+                qname = b"".join(bytes([len(l)]) + (l.encode("idna") if not l.isascii() else l.encode()) for l in host.split(".")) + b"\x00"
+                query = struct.pack(">HHHHHH", txid, 0x0100, 1, 0, 0, 0) + qname + struct.pack(">HH", 1, 1)
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(1.5)
+                if phys_ip:
+                    try:
+                        s.bind((phys_ip, 0))
+                    except OSError:
+                        pass
+                s.sendto(query, (upstream, 53))
+                data, _ = s.recvfrom(4096)
+                if len(data) < 12 or struct.unpack(">H", data[:2])[0] != txid:
+                    continue
+                ancount = struct.unpack(">H", data[6:8])[0]
+                off = skip_dns_question(data, 12)
+                if off < 0:
+                    continue
+                for _ in range(ancount):
+                    if off >= len(data):
+                        break
+                    _, off = _decode_qname(data, off)
+                    if off + 10 > len(data):
+                        break
+                    atype, _aclass, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+                    off += 10
+                    if off + rdlen > len(data):
+                        break
+                    if atype == 1 and rdlen == 4:
+                        res_ip = socket.inet_ntoa(data[off:off + 4])
+                        if not is_fake_ip(res_ip):
+                            return res_ip
+                    off += rdlen
+            except Exception:
+                pass
+            finally:
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+        return None
 
     def _read_loop(self):
         while not self._stop.is_set():

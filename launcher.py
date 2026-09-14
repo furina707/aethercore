@@ -158,21 +158,42 @@ def _parse_sub_userinfo(header_val: str) -> dict:
 
 def _refresh_sub_traffic():
     """后台拉取订阅头，更新剩余流量缓存"""
-    from core.aether_gen import SUB_URL
     try:
+        try:
+            from core.aether_gen import get_sub_url
+        except ImportError:
+            from aether_gen import get_sub_url
+        sub_url = get_sub_url(DATA_DIR)
         req = urllib.request.Request(
-            SUB_URL,
+            sub_url,
             headers={"User-Agent": "ClashMeta; AetherCore"},
             method="HEAD",
         )
-        res = urllib.request.urlopen(req, timeout=10)
-        info_hdr = res.headers.get("subscription-userinfo", "")
+        info_hdr = ""
+        res = None
+        try:
+            res = urllib.request.urlopen(req, timeout=10)
+            info_hdr = res.headers.get("subscription-userinfo", "")
+        finally:
+            if res is not None:
+                try:
+                    res.close()
+                except Exception:
+                    pass
+
         if not info_hdr:
             # HEAD 不返回时改用 GET 但只读头
-            req2 = urllib.request.Request(SUB_URL, headers={"User-Agent": "ClashMeta; AetherCore"})
-            res2 = urllib.request.urlopen(req2, timeout=10)
-            info_hdr = res2.headers.get("subscription-userinfo", "")
-            res2.close()
+            req2 = urllib.request.Request(sub_url, headers={"User-Agent": "ClashMeta; AetherCore"})
+            res2 = None
+            try:
+                res2 = urllib.request.urlopen(req2, timeout=10)
+                info_hdr = res2.headers.get("subscription-userinfo", "")
+            finally:
+                if res2 is not None:
+                    try:
+                        res2.close()
+                    except Exception:
+                        pass
         if info_hdr:
             parsed = _parse_sub_userinfo(info_hdr)
             with _SUB_TRAFFIC_LOCK:
@@ -338,8 +359,10 @@ def kill_conflicting_proxies():
         "clash-verge.exe", "verge-mihomo.exe", "verge-mihomo-alpha.exe",
         "clash.exe", "mihomo.exe", "sing-box.exe", "xray.exe",
     ]
+    taskkill_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
+    tk_cmd = taskkill_exe if os.path.exists(taskkill_exe) else "taskkill"
     try:
-        subprocess.run(["taskkill", "/F"] + [x for p in _proxy_procs for x in ("/IM", p)],
+        subprocess.run([tk_cmd, "/F"] + [x for p in _proxy_procs for x in ("/IM", p)],
             capture_output=True)
     except Exception:
         pass
@@ -609,11 +632,16 @@ def wait_core_listen(host: str, port: int, timeout: float = 8.0) -> bool:
 
 def clean_conflicting_proxies(log_func=None):
     """清理可能冲突的第三方代理进程 (如 Clash Verge / Mihomo / Sing-box 等)"""
-    targets = ["clash-verge.exe", "verge-mihomo-alpha.exe", "clash.exe", "mihomo.exe"]
+    targets = [
+        "clash-verge.exe", "verge-mihomo.exe", "verge-mihomo-alpha.exe",
+        "clash.exe", "mihomo.exe", "sing-box.exe", "xray.exe"
+    ]
     flags = 0x08000000 if sys.platform == 'win32' else 0
+    taskkill_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
+    tk_cmd = taskkill_exe if os.path.exists(taskkill_exe) else "taskkill"
     for proc in targets:
         try:
-            res = subprocess.run(["taskkill", "/F", "/IM", proc],
+            res = subprocess.run([tk_cmd, "/F", "/IM", proc],
                                  capture_output=True, timeout=2, creationflags=flags)
             if res.returncode == 0:
                 msg = f"[*] 检测到第三方代理残留进程 {proc}，已自动安全中止以防劫持冲突"
@@ -694,8 +722,9 @@ class _CoreProc:
         import core.aether_core
         core.aether_core.CORE_STOP_EVENT.set()
     def wait(self, timeout=None):
-        if self._thread:
+        if self._thread and hasattr(self._thread, "join"):
             self._thread.join(timeout=timeout)
+        return self.poll()
 
 def _run_core_thread():
     try:
@@ -1040,6 +1069,7 @@ def _refresh_nodes_async():
         try:
             ok, _, text = _controller_request("GET", "/proxies", timeout=3)
             if ok and text:
+                data = json.loads(text)
                 group = None
                 for k, v in data.get("proxies", {}).items():
                     if "MANUAL" in k or "手动" in k:
@@ -1187,42 +1217,68 @@ class ConnectionTable:
     def __init__(self, max_rows=25):
         self.max_rows = max_rows
         self.rows = collections.OrderedDict()
+        self.lock = threading.Lock()
 
     def upsert(self, key, entry):
-        if key in self.rows:
-            r = self.rows[key]
-            r["count"] += 1
-            r["time"] = entry["time"]
-            r["proc"] = entry["proc"]
-            r["node_plain"] = entry["node_plain"]
-            r["node_prefix"] = entry["node_prefix"]
-            r["target"] = entry["target"]
-            r["proto"] = entry["proto"]
-            if "status" in entry:
-                r["status"] = entry["status"]
-            return False
-        e = dict(entry)
-        e["count"] = 1
-        e["status"] = entry.get("status", "ACTIVE")
-        self.rows[key] = e
-        if len(self.rows) > self.max_rows:
-            self.rows.popitem(last=False)
-        return True
+        with self.lock:
+            if key in self.rows:
+                r = self.rows[key]
+                r["count"] += 1
+                r["time"] = entry["time"]
+                r["proc"] = entry["proc"]
+                r["node_plain"] = entry["node_plain"]
+                r["node_prefix"] = entry["node_prefix"]
+                r["target"] = entry["target"]
+                r["proto"] = entry["proto"]
+                if "status" in entry:
+                    r["status"] = entry["status"]
+                return False
+            e = dict(entry)
+            e["count"] = 1
+            e["status"] = entry.get("status", "ACTIVE")
+            self.rows[key] = e
+            if len(self.rows) > self.max_rows:
+                self.rows.popitem(last=False)
+            return True
 
     def update_status(self, target, status, node_override=None):
-        target_clean = target.split(":")[0].strip().lower()
+        def _clean(h):
+            s = str(h).strip()
+            if s.startswith("["):
+                idx = s.find("]")
+                if idx != -1:
+                    return s[1:idx].strip().lower()
+            if s.count(":") > 1:
+                return s.lower()
+            return s.split(":")[0].strip().lower()
+
+        target_clean = _clean(target)
         matched = False
-        for k, r in self.rows.items():
-            r_target = r["target"].split(":")[0].strip().lower()
-            if r_target == target_clean or r["target"] == target:
-                r["status"] = status
-                if node_override:
-                    r["node_plain"] = node_override
-                matched = True
+        with self.lock:
+            for k, r in self.rows.items():
+                r_target = _clean(r["target"])
+                if r_target == target_clean or r["target"] == target:
+                    r["status"] = status
+                    if node_override:
+                        r["node_plain"] = node_override
+                    matched = True
         return matched
+
+    def clear(self):
+        with self.lock:
+            self.rows.clear()
+
+    def get_items(self):
+        with self.lock:
+            return list(self.rows.items())
+
+    def __len__(self):
+        with self.lock:
+            return len(self.rows)
 
 TRAFFIC = {"up": 0, "down": 0}
 RECENT_LOGS = collections.deque(maxlen=300)
+SEEN_PROCS_LOCK = threading.Lock()
 
 def _traffic_stream():
     while not _CORE_STOP_EVENT.is_set():
@@ -1374,7 +1430,8 @@ def _log_stream(table, seen_procs, log_fp, stopping, tui_active_fn):
                             }
                             key = (proc, target, proto)
                             table.upsert(key, entry)
-                            seen_procs[proc] = seen_procs.get(proc, 0) + 1
+                            with SEEN_PROCS_LOCK:
+                                seen_procs[proc] = seen_procs.get(proc, 0) + 1
 
                             if not tui_active_fn():
                                 node_color = Color.YELLOW if "DIRECT" in node_raw.upper() else Color.CYAN
@@ -1699,7 +1756,7 @@ def _build_frame(table, last_status, width, height, up, down, up_spd, down_spd,
     rows.append([(head_div, colors.GRAY)])
 
     max_data = max(height - 11, 1)
-    items = list(table.rows.items())
+    items = table.get_items()
     if sort_mode == "count":
         items = sorted(items, key=lambda kv: -kv[1]["count"])
     else:
@@ -1792,13 +1849,13 @@ def _build_frame(table, last_status, width, height, up, down, up_spd, down_spd,
     status_line = "│ " + _pad_disp(status_txt, width - 4, "left") + " │"
     rows.append([(status_line, colors.YELLOW)])
 
-    total_ev = sum(r["count"] for r in table.rows.values())
+    total_ev = sum(r["count"] for _, r in items)
     if width < 90:
         left_keys = "╰─ [Q]退出 [Tab]视图 [4]节点 [S]排序 [F]过滤"
-        right_info = f"──[{len(table.rows)}条]─╯"
+        right_info = f"──[{len(items)}条]─╯"
     else:
         left_keys = "╰─ [Q]退出  [Tab/2]日志  [3]分流  [4/N]选节点  [U]更新订阅  [S]排序  [F]过滤  [D]清空"
-        right_info = f"──[ 活动:{len(table.rows)} 总计:{total_ev} ]─╯"
+        right_info = f"──[ 活动:{len(items)} 总计:{total_ev} ]─╯"
     rem_foot = max(width - _disp_width(left_keys) - _disp_width(right_info), 0)
     rows.append([
         (left_keys, colors.CYAN),
@@ -1832,9 +1889,12 @@ def _build_log_frame(recent_logs, last_status, width, height, up, down, up_spd, 
     else:
         for t_str, line in lines:
             c = colors.WHITE
+            tag = " LOG  "
+            tag_c = colors.GRAY + colors.REVERSE
             if "[closed]" in line.lower():
                 c = colors.RED + colors.BOLD
                 tag = "CLOSED"
+                tag_c = colors.RED + colors.REVERSE
             elif "[timeout]" in line.lower():
                 c = colors.MAGENTA + colors.BOLD
                 tag = "TIMEO "
@@ -1900,12 +1960,19 @@ def _build_log_frame(recent_logs, last_status, width, height, up, down, up_spd, 
     return rows
 
 
+def get_sorted_procs(seen_procs):
+    rules = rules_list()
+    with SEEN_PROCS_LOCK:
+        snap_seen = dict(seen_procs)
+    procs = sorted(set(rules) | set(snap_seen),
+                   key=lambda p: (-snap_seen.get(p, 0), p))
+    return procs, snap_seen, rules
+
+
 def _build_app_panel_frame(seen_procs, panel_idx, width, height, last_status,
                            up=0, down=0, up_spd=0.0, down_spd=0.0):
     colors = Color()
-    rules = rules_list()
-    procs = sorted(set(rules) | set(seen_procs),
-                   key=lambda p: (-seen_procs.get(p, 0), p))
+    procs, snap_seen, rules = get_sorted_procs(seen_procs)
     badge = f"[已捕获 {len(procs)} 个进程 │ 定制 {len(rules)} 条]"
     rows = _build_header_card(width, height, active_tab=3, up=up, down=down,
                               up_spd=up_spd, down_spd=down_spd, extra_badge=badge)
@@ -1973,7 +2040,7 @@ def _build_app_panel_frame(seen_procs, panel_idx, width, height, last_status,
                 rule_c = colors.GRAY
                 status_badge = "默认规则"
 
-            cnt = seen_procs.get(p, 0)
+            cnt = snap_seen.get(p, 0)
 
             row = [
                 ("│ ", colors.GRAY),
@@ -2312,7 +2379,7 @@ def monitor_connections_loop(core_holder, stopping, log_fp):
                 elif k == "1":
                     node_panel_active = False
                     if panel_active:
-                        procs = sorted(set(rules_list()) | set(seen_procs), key=lambda p: (-seen_procs.get(p, 0), p))
+                        procs, _, _ = get_sorted_procs(seen_procs)
                         if 0 <= panel_idx < len(procs):
                             set_app_target(procs[panel_idx], "direct")
                             push_status(f"[ok] 已设置 {procs[panel_idx]} 为 本地直连")
@@ -2322,7 +2389,7 @@ def monitor_connections_loop(core_holder, stopping, log_fp):
                 elif k == "2":
                     node_panel_active = False
                     if panel_active:
-                        procs = sorted(set(rules_list()) | set(seen_procs), key=lambda p: (-seen_procs.get(p, 0), p))
+                        procs, _, _ = get_sorted_procs(seen_procs)
                         if 0 <= panel_idx < len(procs):
                             set_app_target(procs[panel_idx], "proxy")
                             push_status(f"[ok] 已设置 {procs[panel_idx]} 为 走代理")
@@ -2332,7 +2399,7 @@ def monitor_connections_loop(core_holder, stopping, log_fp):
                 elif k == "3":
                     node_panel_active = False
                     if panel_active:
-                        procs = sorted(set(rules_list()) | set(seen_procs), key=lambda p: (-seen_procs.get(p, 0), p))
+                        procs, _, _ = get_sorted_procs(seen_procs)
                         if 0 <= panel_idx < len(procs):
                             set_app_target(procs[panel_idx], "auto")
                             push_status(f"[ok] 已设置 {procs[panel_idx]} 为 自动优选")
@@ -2368,15 +2435,15 @@ def monitor_connections_loop(core_holder, stopping, log_fp):
                         nodes = list_manual_nodes()
                         node_panel_idx = min(max(len(nodes) - 1, 0), node_panel_idx + 1)
                     elif panel_active:
-                        procs_len = len(set(rules_list()) | set(seen_procs))
-                        panel_idx = min(max(procs_len - 1, 0), panel_idx + 1)
+                        procs, _, _ = get_sorted_procs(seen_procs)
+                        panel_idx = min(max(len(procs) - 1, 0), panel_idx + 1)
                 elif k in ("k", "UP"):
                     if node_panel_active:
                         node_panel_idx = max(0, node_panel_idx - 1)
                     elif panel_active:
                         panel_idx = max(0, panel_idx - 1)
                 elif k.lower() == "x" and panel_active:
-                    procs = sorted(set(rules_list()) | set(seen_procs), key=lambda p: (-seen_procs.get(p, 0), p))
+                    procs, _, _ = get_sorted_procs(seen_procs)
                     if 0 <= panel_idx < len(procs):
                         remove_app_target(procs[panel_idx])
                         push_status(f"[ok] 已清除 {procs[panel_idx]} 的自定义规则")
@@ -2385,7 +2452,7 @@ def monitor_connections_loop(core_holder, stopping, log_fp):
                         RECENT_LOGS.clear()
                         push_status("[ok] 已清空实时内核日志")
                     else:
-                        table.rows.clear()
+                        table.clear()
                         push_status("[ok] 已清空活动连接表")
                 elif k.lower() == "f":
                     if proto_filter is None:
@@ -2419,6 +2486,8 @@ def monitor_connections_loop(core_holder, stopping, log_fp):
 
             w, h = tui.size()
             eff_w = max(w - 1, 20)
+            with SEEN_PROCS_LOCK:
+                seen_procs_cnt = len(seen_procs)
             if node_panel_active:
                 rows = _build_node_panel_frame(list_manual_nodes(), node_panel_idx, eff_w, h, last_status,
                                               up, down, ema_up, ema_down)
@@ -2427,10 +2496,10 @@ def monitor_connections_loop(core_holder, stopping, log_fp):
                                              up, down, ema_up, ema_down)
             elif view_mode == "logs":
                 rows = _build_log_frame(RECENT_LOGS, last_status, eff_w, h, up, down, ema_up, ema_down,
-                                        len(table.rows), len(seen_procs))
+                                        len(table), seen_procs_cnt)
             else:
                 rows = _build_frame(table, last_status, eff_w, h, up, down, ema_up, ema_down,
-                                    proto_filter, sort_mode, keys_hint, len(seen_procs))
+                                    proto_filter, sort_mode, keys_hint, seen_procs_cnt)
             tui.render(rows)
             last_render = now
 

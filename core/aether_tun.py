@@ -483,30 +483,51 @@ class _IPHLPAPI:
         if not self._ensure_loaded():
             return False, None
         row = MIB_IPFORWARD_ROW2()
+        if hasattr(self._dll, "InitializeIpForwardEntry"):
+            self._dll.InitializeIpForwardEntry(ctypes.byref(row))
         row.InterfaceLuid = luid
         if if_index:
             row.InterfaceIndex = if_index
         if ":" in dest_str:
             row.DestinationPrefix.Prefix = sockaddr_inet_v6(dest_str)
-            if gw_str:
-                row.NextHop = sockaddr_inet_v6(gw_str)
+            row.NextHop = sockaddr_inet_v6(gw_str if gw_str else "::")
         else:
             row.DestinationPrefix.Prefix = sockaddr_inet_v4(dest_str)
-            if gw_str:
-                row.NextHop = sockaddr_inet_v4(gw_str)
+            row.NextHop = sockaddr_inet_v4(gw_str if gw_str else "0.0.0.0")
         row.DestinationPrefix.PrefixLength = prefix_len
         row.Metric = metric
         row.Protocol = 3  # MIB_IPPROTO_NETMGMT
         row.ValidLifetime = 0xFFFFFFFF
         row.PreferredLifetime = 0xFFFFFFFF
         res = self._dll.CreateIpForwardEntry2(ctypes.byref(row))
-        if res != 0 and res != 0x000000B7 and gw_str:
-            if ':' in dest_str:
-                row.NextHop = sockaddr_inet_v6('::')
+        if res == 0 or res == 0x000000B7:
+            return True, row
+
+        # 针对已存在相同前缀路由的更新，尝试 SetIpForwardEntry2
+        if hasattr(self._dll, "SetIpForwardEntry2"):
+            res_set = self._dll.SetIpForwardEntry2(ctypes.byref(row))
+            if res_set == 0:
+                return True, row
+
+        # 降级：通过 netsh 补充添加路由 (容错)
+        if if_index:
+            flags = 0x08000000 if sys.platform == 'win32' else 0
+            if ":" in dest_str:
+                cmd = ['netsh', 'interface', 'ipv6', 'add', 'route', f'prefix={dest_str}/{prefix_len}', f'interface={if_index}', f'metric={metric}', 'store=active']
+                if gw_str:
+                    cmd.append(f'nexthop={gw_str}')
             else:
-                row.NextHop = sockaddr_inet_v4('0.0.0.0')
-            res = self._dll.CreateIpForwardEntry2(ctypes.byref(row))
-        return res == 0 or res == 0x000000B7, row
+                cmd = ['netsh', 'interface', 'ipv4', 'add', 'route', f'prefix={dest_str}/{prefix_len}', f'interface={if_index}', f'metric={metric}', 'store=active']
+                if gw_str:
+                    cmd.append(f'nexthop={gw_str}')
+            try:
+                ret = subprocess.run(cmd, capture_output=True, timeout=3, creationflags=flags)
+                if ret.returncode == 0:
+                    return True, row
+            except Exception:
+                pass
+
+        return False, row
 
     def delete_route(self, row):
         """删除之前添加的路由"""
@@ -711,6 +732,7 @@ class WintunDevice:
         self._route_rows = []       # 所有由本设备添加的路由 (退出时统一删除)
         self._closed = False
         self._send_lock = threading.Lock()
+        self._lock = threading.Lock()
 
     def open(self, engine=None):
         eng = engine or _g_engine
@@ -868,15 +890,17 @@ class WintunDevice:
         """
         results = []
         if with_v4:
-            results.append(self.add_route("0.0.0.0", 1, None))
-            results.append(self.add_route("128.0.0.0", 1, None))
+            r1 = self.add_route("0.0.0.0", 1, None)
+            r2 = self.add_route("128.0.0.0", 1, None)
+            results.extend([r1, r2])
             net, plen = FAKE_V4_NET.split("/")
-            results.append(self.add_route(net, int(plen), None))
+            self.add_route(net, int(plen), None)
         if with_v6:
-            results.append(self.add_route("::", 1, None))
-            results.append(self.add_route("8000::", 1, None))
+            r3 = self.add_route("::", 1, None)
+            r4 = self.add_route("8000::", 1, None)
+            results.extend([r3, r4])
             net, plen = FAKE_V6_NET.split("/")
-            results.append(self.add_route(net, int(plen), None))
+            self.add_route(net, int(plen), None)
         return all(results)
 
     def install_bypass_route_v4(self, dest_ip: str):
@@ -896,23 +920,27 @@ class WintunDevice:
         """从环形缓冲区读取一个数据包
         返回 (packet_bytes, packet_size) 或 (None, 0) 超时
         """
-        if self._closed or not self._session:
+        session = self._session
+        if self._closed or not session:
             return None, 0
 
         eng = _g_engine
         size = wintypes.DWORD(0)
-        packet_ptr = eng.WintunReceivePacket(self._session, ctypes.byref(size))
+        packet_ptr = eng.WintunReceivePacket(session, ctypes.byref(size))
 
         if packet_ptr:
             packet_size = size.value
             data = ctypes.string_at(packet_ptr, packet_size)
-            eng.WintunReleaseReceivePacket(self._session, packet_ptr)
+            eng.WintunReleaseReceivePacket(session, packet_ptr)
             return data, packet_size
 
         err = ctypes.GetLastError()
         if err == 0x103:  # ERROR_NO_MORE_ITEMS
+            event = self._read_event
+            if not event:
+                return None, 0
             wait_ms = timeout_ms if timeout_ms >= 0 else 0xFFFFFFFF
-            ret = ctypes.windll.kernel32.WaitForSingleObject(self._read_event, wait_ms)
+            ret = ctypes.windll.kernel32.WaitForSingleObject(event, wait_ms)
             if ret == 0:  # WAIT_OBJECT_0
                 return self.read_packet(0)
 
@@ -920,7 +948,8 @@ class WintunDevice:
 
     def write_packet(self, data):
         """向环形缓冲区写入一个数据包 (线程安全)"""
-        if self._closed or not self._session:
+        session = self._session
+        if self._closed or not session:
             return False
 
         packet_size = len(data)
@@ -929,16 +958,19 @@ class WintunDevice:
 
         eng = _g_engine
         with self._send_lock:
-            buf_ptr = eng.WintunAllocateSendPacket(self._session, packet_size)
+            session = self._session
+            if self._closed or not session:
+                return False
+            buf_ptr = eng.WintunAllocateSendPacket(session, packet_size)
             if not buf_ptr:
                 return False
             ctypes.memmove(buf_ptr, data, packet_size)
-            eng.WintunSendPacket(self._session, buf_ptr)
+            eng.WintunSendPacket(session, buf_ptr)
         return True
 
     def close(self):
         """关闭网卡并清理所有路由"""
-        with threading.Lock():
+        with self._lock:
             if self._closed:
                 return
             self._closed = True
