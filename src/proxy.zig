@@ -36,12 +36,12 @@ pub const ProxyServer = struct {
     router: router_mod.Router,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
-    pub fn init(allocator: std.mem.Allocator, cfg: *config.AppConfig, stats: *TrafficStats) ProxyServer {
+    pub fn init(allocator: std.mem.Allocator, cfg: *config.AppConfig, stats: *TrafficStats, ip_tracker: *router_mod.IpSessionTracker) ProxyServer {
         return ProxyServer{
             .allocator = allocator,
             .cfg = cfg,
             .stats = stats,
-            .router = router_mod.Router.init(cfg.mode),
+            .router = router_mod.Router.init(cfg.mode, ip_tracker),
         };
     }
 
@@ -95,25 +95,33 @@ pub const ProxyServer = struct {
             return;
         }
 
-        // 3. 路由判决
-        const action = self.router.route(host_slice, port);
-        if (action == .reject) {
+        // 3. 核心功能: 分 IP 代理路由决策
+        const decision = self.router.routeTarget(host_slice, port, self.cfg.active_node_index, self.cfg.nodes.items.len);
+        if (decision.action == .reject) {
             // 默认安全: 规则拦截
             _ = net.sendAll(client_fd, &[_]u8{ 0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }) catch {};
             return;
         }
 
-        // 4. 连接上游 (直连或经代理节点)
+        // 记录分 IP 会话分配状态
+        self.router.ip_tracker.record(host_slice, decision.node_index);
+        defer self.router.ip_tracker.release(host_slice);
+
+        // 4. 连接上游 (直连或经选定的分 IP 代理出口节点)
         var remote_fd: c_int = -1;
-        if (action == .direct or std.mem.eql(u8, self.cfg.getActiveNode().?.protocol, "direct")) {
+        if (decision.action == .direct or decision.node_index == 0) {
             remote_fd = net.connectTcp(host_slice, port) catch {
                 _ = net.sendAll(client_fd, &[_]u8{ 0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }) catch {};
                 return;
             };
         } else {
-            // 连接当前激活节点
-            const active_node = self.cfg.getActiveNode() orelse return;
-            remote_fd = net.connectTcp(active_node.server, active_node.port) catch {
+            // 使用经由一致性哈希/CIDR分流指派的具体代理出口节点
+            const assigned_node = if (decision.node_index < self.cfg.nodes.items.len)
+                self.cfg.nodes.items[decision.node_index]
+            else
+                self.cfg.getActiveNode() orelse return;
+
+            remote_fd = net.connectTcp(assigned_node.server, assigned_node.port) catch {
                 _ = net.sendAll(client_fd, &[_]u8{ 0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }) catch {};
                 return;
             };

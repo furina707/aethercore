@@ -212,6 +212,45 @@ fun MiuixDashboard(
             }
         }
 
+        // 分 IP 代理调度卡片 (Per-IP Proxy Dispatch Card)
+        MiuixCard(backgroundColor = cardColor) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "分 IP 代理调度 (Per-IP Dispatch)",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = textSecondary
+                    )
+                    Text(
+                        text = "一致性哈希出口",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MiuixTheme.PrimaryBlue
+                    )
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(if (isDark) Color(0xFF262A34) else Color(0xFFF0F3F7))
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(text = "🎯 目标 IP: 104.26.12.31", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = textPrimary)
+                        Text(text = "分配出口: 香港专线 01 (VLESS-XTLS)", fontSize = 11.sp, color = textSecondary)
+                    }
+                    Text(text = "会话保持", fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = MiuixTheme.ActiveGreen)
+                }
+            }
+        }
+
         // 分流模式切换器 (MIUIX Segmented Control)
         MiuixCard(backgroundColor = cardColor) {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {

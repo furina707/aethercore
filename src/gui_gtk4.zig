@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const proxy = @import("proxy.zig");
 const security = @import("security.zig");
+const router_mod = @import("router.zig");
 
 pub const GtkWidget = anyopaque;
 pub const GtkApplication = anyopaque;
@@ -43,6 +44,7 @@ pub const GuiContext = struct {
     cfg: *config.AppConfig,
     stats: *proxy.TrafficStats,
     sec: *const security.SecurityManager,
+    ip_tracker: *router_mod.IpSessionTracker,
     is_mobile: bool = false,
 
     // UI 引用
@@ -52,6 +54,7 @@ pub const GuiContext = struct {
     lbl_conns: ?*GtkWidget = null,
     lbl_active_node: ?*GtkWidget = null,
     lbl_current_mode: ?*GtkWidget = null,
+    lbl_ip_dispatch: ?*GtkWidget = null,
 };
 
 var global_ctx: ?*GuiContext = null;
@@ -172,6 +175,25 @@ fn onUpdateTimer(user_data: ?*anyopaque) callconv(.c) c_int {
     const conn_full = printZ(&conn_str, "⚡ 活动连接: {}", .{conns});
     if (ctx.lbl_conns) |lbl| {
         gtk_label_set_text(lbl, conn_full);
+    }
+
+    // 更新分 IP 代理动态调度
+    if (ctx.lbl_ip_dispatch) |lbl| {
+        ctx.ip_tracker.lock_state.lock();
+        defer ctx.ip_tracker.lock_state.unlock();
+        if (ctx.ip_tracker.count > 0) {
+            const latest = ctx.ip_tracker.entries[ctx.ip_tracker.count - 1];
+            const ip_str = latest.target_ip[0..latest.target_ip_len];
+            const node_name = if (latest.node_index < ctx.cfg.nodes.items.len)
+                ctx.cfg.nodes.items[latest.node_index].name
+            else
+                "直连出站";
+            var ip_buf: [160]u8 = undefined;
+            const full_ip = printZ(&ip_buf, "🎯 目标 {s} -> 分配出口 [{s}] (活跃连接: {})", .{ ip_str, node_name, latest.active_conns });
+            gtk_label_set_text(lbl, full_ip);
+        } else {
+            gtk_label_set_text(lbl, "🎯 分 IP 代理就绪: 目标 IP 自动哈希调度出口");
+        }
     }
 
     return 1; // 保持定时器继续
@@ -302,6 +324,23 @@ fn onAppActivate(app: ?*GtkApplication, _: ?*anyopaque) callconv(.c) void {
         ctx.lbl_traffic_down = lbl_down;
         ctx.lbl_conns = lbl_conn;
     }
+
+    // 4. 分 IP 代理调度监控卡片 (Per-IP Proxy Card)
+    const ip_card = gtk_box_new(1, 8);
+    gtk_widget_add_css_class(ip_card, "miuix-card");
+
+    const lbl_ip_header = gtk_label_new("分 IP 代理引擎 (Per-IP Consistent Hash Dispatch)");
+    gtk_widget_add_css_class(lbl_ip_header, "stat-label");
+    gtk_box_append(ip_card, lbl_ip_header);
+
+    const lbl_ip_details = gtk_label_new("🎯 分 IP 代理就绪: 目标 IP 自动哈希调度出口");
+    gtk_widget_add_css_class(lbl_ip_details, "node-item");
+    gtk_box_append(ip_card, lbl_ip_details);
+
+    if (global_ctx) |ctx| {
+        ctx.lbl_ip_dispatch = lbl_ip_details;
+    }
+    gtk_box_append(root_box, ip_card);
 
     // 5. 分流模式选择卡片 (Routing Mode Card)
     const mode_card = gtk_box_new(1, 10);

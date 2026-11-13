@@ -4,6 +4,7 @@ const security = @import("security.zig");
 const net = @import("net.zig");
 const proxy = @import("proxy.zig");
 const control = @import("control.zig");
+const router = @import("router.zig");
 const dwm_render = @import("dwm_render.zig");
 const gui_gtk4 = @import("gui_gtk4.zig");
 
@@ -62,17 +63,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer cfg.deinit(allocator);
 
     var stats = proxy.TrafficStats{};
+    var ip_tracker = router.IpSessionTracker{};
 
     // 5. 启动后台网络代理服务与控制面服务
     const srv_thread_ctx = struct {
         sec: *const security.SecurityManager,
         cfg: *config.AppConfig,
         stats: *proxy.TrafficStats,
+        ip_tracker: *router.IpSessionTracker,
         allocator: std.mem.Allocator,
     }{
         .sec = &sec,
         .cfg = &cfg,
         .stats = &stats,
+        .ip_tracker = &ip_tracker,
         .allocator = allocator,
     };
 
@@ -90,6 +94,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             .cfg = &cfg,
             .stats = &stats,
             .sec = &sec,
+            .ip_tracker = &ip_tracker,
             .is_mobile = is_mobile,
         };
         gui_gtk4.runGui(&gui_ctx) catch |err| {
@@ -126,11 +131,12 @@ fn runCoreServices(ctx: anytype) void {
         ctx.sec,
         ctx.cfg,
         ctx.stats,
+        ctx.ip_tracker,
     }) catch return;
     ctrl_thread.detach();
 
-    // 主代理循环 (SOCKS5)
-    var p_server = proxy.ProxyServer.init(ctx.allocator, ctx.cfg, ctx.stats);
+    // 主代理循环 (SOCKS5 结合分 IP 代理引擎)
+    var p_server = proxy.ProxyServer.init(ctx.allocator, ctx.cfg, ctx.stats, ctx.ip_tracker);
     while (true) {
         const client_fd = net.acceptTcp(socks_fd) catch continue;
         const worker = std.Thread.spawn(.{}, handleProxyClient, .{ &p_server, client_fd }) catch {
@@ -151,8 +157,9 @@ fn runControlLoop(
     sec: *const security.SecurityManager,
     cfg: *config.AppConfig,
     stats: *proxy.TrafficStats,
+    ip_tracker: *router.IpSessionTracker,
 ) void {
-    var cp = control.ControlPlane.init(allocator, sec, cfg, stats);
+    var cp = control.ControlPlane.init(allocator, sec, cfg, stats, ip_tracker);
     while (true) {
         const client_fd = net.acceptTcp(listener_fd) catch continue;
         const worker = std.Thread.spawn(.{}, handleControlClient, .{ &cp, client_fd }) catch {

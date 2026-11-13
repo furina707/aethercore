@@ -45,6 +45,36 @@ pub fn parseIp4(str: []const u8) ?u32 {
         (@as(u32, parts[3]) << 24);
 }
 
+pub fn parseIp4Host(str: []const u8) ?u32 {
+    var parts: [4]u8 = undefined;
+    var idx: usize = 0;
+    var current: u32 = 0;
+    var has_digit = false;
+
+    for (str) |c| {
+        if (c >= '0' and c <= '9') {
+            current = current * 10 + (c - '0');
+            if (current > 255) return null;
+            has_digit = true;
+        } else if (c == '.') {
+            if (!has_digit or idx >= 3) return null;
+            parts[idx] = @intCast(current);
+            idx += 1;
+            current = 0;
+            has_digit = false;
+        } else {
+            return null;
+        }
+    }
+    if (!has_digit or idx != 3) return null;
+    parts[3] = @intCast(current);
+
+    return (@as(u32, parts[0]) << 24) |
+        (@as(u32, parts[1]) << 16) |
+        (@as(u32, parts[2]) << 8) |
+        (@as(u32, parts[3]));
+}
+
 pub fn createTcpListener(host: []const u8, port: u16) !c_int {
     const fd = std.c.socket(2, 1, 0); // AF_INET, SOCK_STREAM
     if (fd < 0) return error.SocketCreateFailed;

@@ -3,12 +3,14 @@ const net = @import("net.zig");
 const security = @import("security.zig");
 const config = @import("config.zig");
 const proxy = @import("proxy.zig");
+const router_mod = @import("router.zig");
 
 pub const ControlPlane = struct {
     allocator: std.mem.Allocator,
     sec: *const security.SecurityManager,
     cfg: *config.AppConfig,
     stats: *proxy.TrafficStats,
+    ip_tracker: *router_mod.IpSessionTracker,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
     pub fn init(
@@ -16,12 +18,14 @@ pub const ControlPlane = struct {
         sec: *const security.SecurityManager,
         cfg: *config.AppConfig,
         stats: *proxy.TrafficStats,
+        ip_tracker: *router_mod.IpSessionTracker,
     ) ControlPlane {
         return ControlPlane{
             .allocator = allocator,
             .sec = sec,
             .cfg = cfg,
             .stats = stats,
+            .ip_tracker = ip_tracker,
         };
     }
 
@@ -55,6 +59,8 @@ pub const ControlPlane = struct {
             self.respondState(client_fd);
         } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/nodes")) {
             self.respondNodes(client_fd);
+        } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/ips")) {
+            self.respondIps(client_fd);
         } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/health")) {
             self.respondJson(client_fd, "{\"status\":\"healthy\",\"secure\":true,\"loopback_only\":true}\n");
         } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/mode")) {
@@ -119,6 +125,44 @@ pub const ControlPlane = struct {
                 n.server,
                 n.port,
                 n.latency_ms,
+            }) catch return;
+            pos += item.len;
+        }
+
+        const tail = std.fmt.bufPrint(buf[pos..], "]}}\n", .{}) catch return;
+        pos += tail.len;
+
+        self.respondJson(client_fd, buf[0..pos]);
+    }
+
+    fn respondIps(self: *ControlPlane, client_fd: c_int) void {
+        var buf: [4096]u8 = undefined;
+        var pos: usize = 0;
+
+        const h = std.fmt.bufPrint(buf[pos..], "{{\"strategy\":\"per_ip_consistent_hash\",\"active_ip_count\":{},\"routes\":[", .{
+            self.ip_tracker.count,
+        }) catch return;
+        pos += h.len;
+
+        self.ip_tracker.lock_state.lock();
+        defer self.ip_tracker.lock_state.unlock();
+
+        for (self.ip_tracker.entries[0..self.ip_tracker.count], 0..) |entry, i| {
+            if (i > 0) {
+                buf[pos] = ',';
+                pos += 1;
+            }
+            const ip_str = entry.target_ip[0..entry.target_ip_len];
+            const node_name = if (entry.node_index < self.cfg.nodes.items.len)
+                self.cfg.nodes.items[entry.node_index].name
+            else
+                "直连出站";
+
+            const item = std.fmt.bufPrint(buf[pos..], "{{\"target_ip\":\"{s}\",\"assigned_node\":\"{s}\",\"active_conns\":{},\"total_conns\":{}}}", .{
+                ip_str,
+                node_name,
+                entry.active_conns,
+                entry.total_conns,
             }) catch return;
             pos += item.len;
         }
