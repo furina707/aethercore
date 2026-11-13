@@ -1,0 +1,15 @@
+.{
+    .name = .aethercore,
+    .version = "1.0.0",
+    .dependencies = .{},
+    .minimum_zig_version = "0.17.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "mobile",
+        "run.py",
+        "README.md",
+    },
+    .fingerprint = 0xcafa292eac9a2a06,
+}

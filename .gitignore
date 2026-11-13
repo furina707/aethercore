@@ -1,0 +1,13 @@
+# Zig 构建产物 / 缓存（由 zig build 自动生成，不纳入版本控制）
+.zig-cache/
+zig-out/
+zig-pkg/
+
+# 本地缓存 / 数据目录
+data/
+*.token
+.dsh-created-plugins/
+
+# Python
+__pycache__/
+*.pyc
