@@ -43,31 +43,14 @@
 
 ## 快速上手
 
-### 构建与运行单二进制
+仅需一条命令即可完成编译与启动：
 
 ```bash
-# 极简脚本拉起 (自动编译并运行单一二进制)
 python3 run.py
-
-# 以 ReleaseFast 优化模式运行
-python3 run.py --release
-
-# 以守护进程模式运行 (无头服务器环境)
-python3 run.py -- --daemon
-
-# 强制拉起 Linux GTK4 桌面 GUI
-python3 run.py -- --gui
 ```
 
-### 直接使用 Zig 编译
-
-```bash
-# 编译
-zig build
-
-# 运行产物
-./zig-out/bin/aethercore -h
-```
+* 脚本仅负责构建与拉起原生单二进制，不包含任何业务代码。
+* **自适应运行**：检测到图形桌面环境自动拉起 GTK4 界面；无图形环境自动以守护进程运行。无需任何繁琐参数。
 
 ---
 
