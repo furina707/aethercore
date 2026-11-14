@@ -69,13 +69,13 @@ pub const TunDevice = struct {
         self.fd = fd;
         self.is_active = true;
 
-        // 配置网卡 IP 与状态 (198.18.0.1/15)
-        _ = system("sudo ip addr add 198.18.0.1/15 dev aether0 2>/dev/null");
-        _ = system("sudo ip link set dev aether0 mtu 1500 2>/dev/null");
-        _ = system("sudo ip link set dev aether0 up 2>/dev/null");
+        // 配置网卡 IP 与状态 (198.18.0.1/15) - 进程以 root 权限直接配置
+        _ = system("ip addr add 198.18.0.1/15 dev aether0 2>/dev/null");
+        _ = system("ip link set dev aether0 mtu 1500 2>/dev/null");
+        _ = system("ip link set dev aether0 up 2>/dev/null");
     }
 
-    /// 全量劫持系统网络流量进入 TUN
+    /// 全量劫持系统网络流量进入 TUN (需 root 权限操作内核路由表)
     pub fn takeoverRoutes(self: *TunDevice) void {
         if (!self.is_active) return;
 
@@ -83,15 +83,15 @@ pub const TunDevice = struct {
         for (self.cfg.nodes.items) |n| {
             if (n.server.len > 0 and !std.mem.eql(u8, n.server, "127.0.0.1")) {
                 var cmd_buf: [128]u8 = undefined;
-                const cmd = printZ(&cmd_buf, "sudo ip route add {s} metric 0 2>/dev/null", .{n.server});
+                const cmd = printZ(&cmd_buf, "ip route add {s} metric 0 2>/dev/null", .{n.server});
                 _ = system(cmd);
             }
         }
 
         // 2. 双半路由全量劫持所有出站流量 (0.0.0.0/1 和 128.0.0.0/1)
         // 最长前缀匹配自动覆盖默认 0.0.0.0/0 路由，不破坏原物理网卡网关
-        _ = system("sudo ip route add 0.0.0.0/1 dev aether0 2>/dev/null");
-        _ = system("sudo ip route add 128.0.0.0/1 dev aether0 2>/dev/null");
+        _ = system("ip route add 0.0.0.0/1 dev aether0 2>/dev/null");
+        _ = system("ip route add 128.0.0.0/1 dev aether0 2>/dev/null");
 
         // 启动后台读取分流线程
         if (!self.worker_running) {
@@ -105,18 +105,18 @@ pub const TunDevice = struct {
     pub fn restoreRoutes(self: *TunDevice) void {
         if (!self.is_active) return;
 
-        _ = system("sudo ip route del 0.0.0.0/1 dev aether0 2>/dev/null");
-        _ = system("sudo ip route del 128.0.0.0/1 dev aether0 2>/dev/null");
+        _ = system("ip route del 0.0.0.0/1 dev aether0 2>/dev/null");
+        _ = system("ip route del 128.0.0.0/1 dev aether0 2>/dev/null");
 
         for (self.cfg.nodes.items) |n| {
             if (n.server.len > 0 and !std.mem.eql(u8, n.server, "127.0.0.1")) {
                 var cmd_buf: [128]u8 = undefined;
-                const cmd = printZ(&cmd_buf, "sudo ip route del {s} 2>/dev/null", .{n.server});
+                const cmd = printZ(&cmd_buf, "ip route del {s} 2>/dev/null", .{n.server});
                 _ = system(cmd);
             }
         }
 
-        _ = system("sudo ip link set dev aether0 down 2>/dev/null");
+        _ = system("ip link set dev aether0 down 2>/dev/null");
 
         if (self.fd >= 0) {
             _ = std.c.close(self.fd);

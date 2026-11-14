@@ -34,6 +34,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = init;
     const allocator = std.heap.c_allocator;
 
+    // 0. 检查 root 权限 (TUN 虚拟网卡与系统路由劫持属于内核网络子系统，必须以 root 权限执行)
+    if (std.c.geteuid() != 0) {
+        std.debug.print("[AetherCore] 警告: 当前未以 root 权限运行！TUN 虚拟网卡与全局流量劫持需要 root (sudo) 权限。\n", .{});
+    }
+
     // 1. 初始化安全管理器 (回环限制与令牌授权)
     var sec = try security.SecurityManager.init(allocator, false);
     defer sec.deinit();
