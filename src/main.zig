@@ -7,16 +7,38 @@ const control = @import("control.zig");
 const router = @import("router.zig");
 const dwm_render = @import("dwm_render.zig");
 const gui_gtk4 = @import("gui_gtk4.zig");
+const tun = @import("tun.zig");
+
+var global_tun: ?*tun.TunDevice = null;
+
+extern "c" fn signal(sig: c_int, handler: ?*const fn (c_int) callconv(.c) void) ?*const fn (c_int) callconv(.c) void;
+
+fn onSignal(_: c_int) callconv(.c) void {
+    if (global_tun) |dev| {
+        dev.restoreRoutes();
+    }
+    std.c.exit(0);
+}
+
+fn hasDisplay() bool {
+    if (std.c.getenv("WAYLAND_DISPLAY")) |w| {
+        if (w[0] != 0) return true;
+    }
+    if (std.c.getenv("DISPLAY")) |d| {
+        if (d[0] != 0) return true;
+    }
+    return false;
+}
 
 pub fn main(init: std.process.Init.Minimal) !void {
     _ = init;
     const allocator = std.heap.c_allocator;
 
-    // 1. 初始化默认安全管理器 (强制仅回环 127.0.0.1)
+    // 1. 初始化安全管理器 (回环限制与令牌授权)
     var sec = try security.SecurityManager.init(allocator, false);
     defer sec.deinit();
 
-    // 2. 初始化 DWM 高清渲染器 (PerMonitorV2 原生点阵物理像素)
+    // 2. 初始化 DWM 高清渲染器 (PerMonitorV2 原生物理点阵)
     const dwm = dwm_render.DwmPhysicalRenderer.init();
     _ = dwm;
 
@@ -27,89 +49,57 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var stats = proxy.TrafficStats{};
     var ip_tracker = router.IpSessionTracker{};
 
-    // 4. 后台启动网络核心 (SOCKS5 / 分 IP 代理 / REST 控制面)
-    const srv_thread_ctx = struct {
+    // 4. 初始化 TUN 虚拟网卡设备 (纯 TUN 模式流量全量劫持)
+    var tun_dev = tun.TunDevice.init(allocator, &cfg, &stats, &ip_tracker);
+    global_tun = &tun_dev;
+
+    // 安装退出信号处理 (确保恢复路由)
+    _ = signal(2, &onSignal); // SIGINT
+    _ = signal(15, &onSignal); // SIGTERM
+
+    // 5. 启动内部 REST 控制面 (供调试或本地自动化调用)
+    const ctrl_thread_ctx = struct {
+        allocator: std.mem.Allocator,
         sec: *const security.SecurityManager,
         cfg: *config.AppConfig,
         stats: *proxy.TrafficStats,
         ip_tracker: *router.IpSessionTracker,
-        allocator: std.mem.Allocator,
     }{
+        .allocator = allocator,
         .sec = &sec,
         .cfg = &cfg,
         .stats = &stats,
         .ip_tracker = &ip_tracker,
-        .allocator = allocator,
     };
+    const ctrl_thread = try std.Thread.spawn(.{}, runControlService, .{ctrl_thread_ctx});
+    ctrl_thread.detach();
 
-    const srv_thread = try std.Thread.spawn(.{}, runCoreServices, .{srv_thread_ctx});
-    srv_thread.detach();
-
-    // 5. 自动运行: 有显示服务时直接运行图形界面，无显示环境以守护进程运行
-    const has_display = std.c.getenv("DISPLAY") != null or std.c.getenv("WAYLAND_DISPLAY") != null;
-
-    if (has_display) {
+    // 6. 判断显示服务: 有显示环境启动原生 GTK4 界面，无显示环境启动守护进程
+    if (hasDisplay()) {
         var gui_ctx = gui_gtk4.GuiContext{
             .cfg = &cfg,
             .stats = &stats,
             .sec = &sec,
             .ip_tracker = &ip_tracker,
+            .tun_dev = &tun_dev,
         };
         gui_gtk4.runGui(&gui_ctx) catch {
-            runTerminalLoop(&stats);
+            runDaemonMode(&tun_dev, &stats);
         };
     } else {
-        runTerminalLoop(&stats);
+        runDaemonMode(&tun_dev, &stats);
     }
+
+    tun_dev.restoreRoutes();
 }
 
-fn runCoreServices(ctx: anytype) void {
+fn runControlService(ctx: anytype) void {
     const host = ctx.sec.getListenHost();
-
-    // 启动 SOCKS5 监听
-    const socks_fd = net.createTcpListener(host, ctx.cfg.socks5_port) catch return;
-
-    // 启动 REST 控制面监听
     const ctrl_fd = net.createTcpListener(host, ctx.cfg.control_port) catch return;
 
-    // 启动控制面处理线程
-    const ctrl_thread = std.Thread.spawn(.{}, runControlLoop, .{
-        ctx.allocator,
-        ctrl_fd,
-        ctx.sec,
-        ctx.cfg,
-        ctx.stats,
-        ctx.ip_tracker,
-    }) catch return;
-    ctrl_thread.detach();
-
-    // 主代理循环 (SOCKS5 结合分 IP 代理引擎)
-    var p_server = proxy.ProxyServer.init(ctx.allocator, ctx.cfg, ctx.stats, ctx.ip_tracker);
+    var cp = control.ControlPlane.init(ctx.allocator, ctx.sec, ctx.cfg, ctx.stats, ctx.ip_tracker);
     while (true) {
-        const client_fd = net.acceptTcp(socks_fd) catch continue;
-        const worker = std.Thread.spawn(.{}, handleProxyClient, .{ &p_server, client_fd }) catch {
-            net.closeSocket(client_fd);
-            continue;
-        };
-        worker.detach();
-    }
-}
-
-fn handleProxyClient(p_server: *proxy.ProxyServer, client_fd: c_int) void {
-    p_server.handleSocks5Client(client_fd);
-}
-
-fn runControlLoop(
-    allocator: std.mem.Allocator,
-    listener_fd: c_int,
-    sec: *const security.SecurityManager,
-    cfg: *config.AppConfig,
-    stats: *proxy.TrafficStats,
-    ip_tracker: *router.IpSessionTracker,
-) void {
-    var cp = control.ControlPlane.init(allocator, sec, cfg, stats, ip_tracker);
-    while (true) {
-        const client_fd = net.acceptTcp(listener_fd) catch continue;
+        const client_fd = net.acceptTcp(ctrl_fd) catch continue;
         const worker = std.Thread.spawn(.{}, handleControlClient, .{ &cp, client_fd }) catch {
             net.closeSocket(client_fd);
             continue;
@@ -124,12 +114,20 @@ fn handleControlClient(cp: *control.ControlPlane, client_fd: c_int) void {
 
 extern "c" fn sleep(seconds: c_uint) c_uint;
 
-fn runTerminalLoop(stats: *proxy.TrafficStats) void {
-    while (true) {
+fn runDaemonMode(tun_dev: *tun.TunDevice, stats: *proxy.TrafficStats) void {
+    // 纯 TUN 守护模式: 自动创建 TUN 并接管所有网络流量
+    tun_dev.open() catch |err| {
+        std.debug.print("[TUN] 打开 TUN 虚拟网卡失败: {}\n", .{err});
+        return;
+    };
+    tun_dev.takeoverRoutes();
+    std.debug.print("[TUN] aether0 网卡已激活，已全量接管系统网络流量 (分 IP 代理中)\n", .{});
+
+    while (tun_dev.is_active) {
         _ = sleep(2);
         const up = stats.bytes_uploaded.load(.monotonic);
         const down = stats.bytes_downloaded.load(.monotonic);
         const conns = stats.active_connections.load(.monotonic);
-        std.debug.print("[Live] 连接: {} | 上传: {} B | 下载: {} B\n", .{ conns, up, down });
+        std.debug.print("[TUN 流量] 活跃 IP: {} | 上传: {} B | 下载: {} B\n", .{ conns, up, down });
     }
 }

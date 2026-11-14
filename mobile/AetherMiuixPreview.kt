@@ -22,14 +22,15 @@ import androidx.compose.ui.unit.sp
 /**
  * AetherCore Mobile - MIUIX 风格界面与 Compose 预览规范
  * 
- * 视觉契约:
+ * 核心设计:
  * 1. 遵循小米澎湃 OS (HyperOS / MIUIX) 视觉规范:
  *    - 24dp 超椭圆大圆角卡片 (Squircle / Rounded Card)
  *    - 高对比度状态指示胶囊 (Status Pill)
  *    - 极简分段选择器 (Segmented Tab Bar)
  *    - 呼吸感状态徽章与流体开关
- * 2. 默认安全设计呈现:
- *    - 显式展示 "默认安全" 状态指示卡片 (环回隔离 + CSPRNG 鉴权保护)
+ * 2. 纯 TUN 模式流量劫持 (无需配置端口):
+ *    - 虚拟网卡 aether0 全网接管
+ *    - 核心功能「分 IP 代理」(Consistent IP Hash)
  */
 
 // MIUIX 调色板
@@ -45,8 +46,6 @@ object MiuixTheme {
     val TextSecondaryLight = Color(0xFF888888)
     val TextPrimaryDark = Color(0xFFF0F0F0)
     val TextSecondaryDark = Color(0xFF8E929B)
-    val SecureGreenBg = Color(0xFFE8F8EE)
-    val SecureGreenText = Color(0xFF0F7A38)
 }
 
 enum class ProxyMode(val title: String) {
@@ -107,7 +106,7 @@ fun MiuixDashboard(
                     color = textPrimary
                 )
                 Text(
-                    text = "高性能纯 Zig 网络内核",
+                    text = "TUN 全网接管 · 分 IP 代理内核",
                     fontSize = 13.sp,
                     color = textSecondary
                 )
@@ -128,7 +127,7 @@ fun MiuixDashboard(
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = if (isRunning) "已连接" else "已暂停",
+                        text = if (isRunning) "TUN 接管中" else "已暂停",
                         fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = if (isRunning) MiuixTheme.ActiveGreen else Color.Gray
@@ -137,7 +136,7 @@ fun MiuixDashboard(
             }
         }
 
-        // 核心主开关卡片 (Master Switch Card)
+        // 核心主开关卡片 (Master TUN Switch Card - 无端口纯接管)
         MiuixCard(backgroundColor = cardColor) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -146,13 +145,13 @@ fun MiuixDashboard(
             ) {
                 Column {
                     Text(
-                        text = "网络代理引擎",
-                        fontSize = 18.sp,
+                        text = "TUN 虚拟网卡全量接管 (aether0)",
+                        fontSize = 17.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = textPrimary
                     )
                     Text(
-                        text = if (isRunning) "SOCKS5: 10808 | HTTP: 10809" else "服务未启动",
+                        text = if (isRunning) "全量出站流量劫持生效 · 无需配置端口" else "未接管网络 · 直连物理网卡",
                         fontSize = 13.sp,
                         color = textSecondary
                     )
@@ -165,6 +164,70 @@ fun MiuixDashboard(
                         checkedTrackColor = MiuixTheme.PrimaryBlue
                     )
                 )
+            }
+        }
+
+        // 分 IP 代理调度卡片 (Per-IP Proxy Dispatch Card)
+        MiuixCard(backgroundColor = cardColor) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "核心功能: 分 IP 代理 (Per-IP Hash)",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = textPrimary
+                    )
+                    Text(
+                        text = "一致性哈希多出口",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = MiuixTheme.PrimaryBlue
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(if (isDark) Color(0xFF14171E) else Color(0xFFF0F7FF))
+                        .padding(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text(
+                                text = "🎯 目标 IP: 104.244.42.1 (X / Twitter)",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = textPrimary
+                            )
+                            Text(
+                                text = "自动分配出口: [香港专线 01] · 会话粘性保持",
+                                fontSize = 12.sp,
+                                color = textSecondary
+                            )
+                        }
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MiuixTheme.ActiveGreen.copy(alpha = 0.15f))
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = "已锁定",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MiuixTheme.ActiveGreen
+                            )
+                        }
+                    }
+                }
             }
         }
 
@@ -201,7 +264,7 @@ fun MiuixDashboard(
                     )
                     MetricItem(
                         icon = "⚡",
-                        label = "活动连接",
+                        label = "活动 IP 会话",
                         value = if (isRunning) "5" else "0",
                         total = "总计 128",
                         primaryColor = MiuixTheme.WarningOrange,
@@ -212,50 +275,11 @@ fun MiuixDashboard(
             }
         }
 
-        // 分 IP 代理调度卡片 (Per-IP Proxy Dispatch Card)
-        MiuixCard(backgroundColor = cardColor) {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "分 IP 代理调度 (Per-IP Dispatch)",
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Medium,
-                        color = textSecondary
-                    )
-                    Text(
-                        text = "一致性哈希出口",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MiuixTheme.PrimaryBlue
-                    )
-                }
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(if (isDark) Color(0xFF262A34) else Color(0xFFF0F3F7))
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column {
-                        Text(text = "🎯 目标 IP: 104.26.12.31", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = textPrimary)
-                        Text(text = "分配出口: 香港专线 01 (VLESS-XTLS)", fontSize = 11.sp, color = textSecondary)
-                    }
-                    Text(text = "会话保持", fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = MiuixTheme.ActiveGreen)
-                }
-            }
-        }
-
-        // 分流模式切换器 (MIUIX Segmented Control)
+        // 路由分流模式选择卡片 (Segmented Tabs)
         MiuixCard(backgroundColor = cardColor) {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    text = "路由模式",
+                    text = "分流模式",
                     fontSize = 14.sp,
                     fontWeight = FontWeight.Medium,
                     color = textSecondary
@@ -263,26 +287,26 @@ fun MiuixDashboard(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(if (isDark) Color(0xFF262A34) else Color(0xFFF0F3F7))
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(if (isDark) Color(0xFF14171E) else Color(0xFFF0F3F6))
                         .padding(4.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     ProxyMode.values().forEach { mode ->
                         val isSelected = currentMode == mode
                         Box(
                             modifier = Modifier
                                 .weight(1f)
-                                .clip(RoundedCornerShape(10.dp))
+                                .clip(RoundedCornerShape(12.dp))
                                 .background(if (isSelected) MiuixTheme.PrimaryBlue else Color.Transparent)
                                 .clickable { currentMode = mode }
-                                .padding(vertical = 8.dp),
+                                .padding(vertical = 10.dp),
                             contentAlignment = Alignment.Center
                         ) {
                             Text(
                                 text = mode.title,
                                 fontSize = 13.sp,
-                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
                                 color = if (isSelected) Color.White else textSecondary
                             )
                         }
@@ -291,60 +315,36 @@ fun MiuixDashboard(
             }
         }
 
-        // 节点列表卡片 (Proxy Node List)
+        // 节点列表卡片 (Nodes Card)
         MiuixCard(backgroundColor = cardColor) {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(
-                    text = "节点选择",
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = textSecondary
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "出站代理节点",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = textSecondary
+                    )
+                    Text(
+                        text = "按 IP 动态分流",
+                        fontSize = 12.sp,
+                        color = MiuixTheme.PrimaryBlue
+                    )
+                }
                 nodes.forEachIndexed { index, node ->
                     val isSelected = selectedNodeIndex == index
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(
-                                if (isSelected) MiuixTheme.PrimaryBlue.copy(alpha = 0.08f)
-                                else Color.Transparent
-                            )
-                            .clickable { selectedNodeIndex = index }
-                            .padding(horizontal = 12.dp, vertical = 10.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column {
-                            Text(
-                                text = node.name,
-                                fontSize = 14.sp,
-                                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-                                color = if (isSelected) MiuixTheme.PrimaryBlue else textPrimary
-                            )
-                            Text(
-                                text = "协议: ${node.protocol.uppercase()} | 区域: ${node.region}",
-                                fontSize = 11.sp,
-                                color = textSecondary
-                            )
-                        }
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(
-                                    if (node.latencyMs < 30) MiuixTheme.ActiveGreen.copy(alpha = 0.15f)
-                                    else MiuixTheme.WarningOrange.copy(alpha = 0.15f)
-                                )
-                                .padding(horizontal = 8.dp, vertical = 4.dp)
-                        ) {
-                            Text(
-                                text = "${node.latencyMs} ms",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = if (node.latencyMs < 30) MiuixTheme.ActiveGreen else MiuixTheme.WarningOrange
-                            )
-                        }
-                    }
+                    NodeItemView(
+                        node = node,
+                        isSelected = isSelected,
+                        cardColor = cardColor,
+                        textPrimary = textPrimary,
+                        textSecondary = textSecondary,
+                        onClick = { selectedNodeIndex = index }
+                    )
                 }
             }
         }
@@ -354,16 +354,20 @@ fun MiuixDashboard(
 @Composable
 fun MiuixCard(
     backgroundColor: Color,
+    modifier: Modifier = Modifier,
     content: @Composable ColumnScope.() -> Unit
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(22.dp))
-            .background(backgroundColor)
-            .padding(18.dp),
-        content = content
-    )
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = backgroundColor),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            content = content
+        )
+    }
 }
 
 @Composable
@@ -376,24 +380,96 @@ fun MetricItem(
     textPrimary: Color,
     textSecondary: Color
 ) {
-    Column {
-        Text(text = "$icon $label", fontSize = 11.sp, color = textSecondary)
-        Spacer(modifier = Modifier.height(2.dp))
-        Text(text = value, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = primaryColor)
-        Text(text = total, fontSize = 10.sp, color = textSecondary)
+    Column(
+        modifier = Modifier.width(96.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = "$icon $label",
+            fontSize = 12.sp,
+            color = textSecondary
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = value,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold,
+            color = primaryColor
+        )
+        Text(
+            text = total,
+            fontSize = 11.sp,
+            color = textSecondary
+        )
     }
 }
 
-// ======================== Compose 预览定义 ========================
-
-@Preview(name = "MIUIX 亮色风格预览", showBackground = true, widthDp = 390, heightDp = 844)
 @Composable
-fun PreviewMiuixDashboardLight() {
+fun NodeItemView(
+    node: NodeItem,
+    isSelected: Boolean,
+    cardColor: Color,
+    textPrimary: Color,
+    textSecondary: Color,
+    onClick: () -> Unit
+) {
+    val borderColor = if (isSelected) MiuixTheme.PrimaryBlue else Color.Transparent
+    val bgItem = if (isSelected) MiuixTheme.PrimaryBlue.copy(alpha = 0.08f) else Color(0x08000000)
+
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(16.dp),
+        color = bgItem,
+        border = androidx.compose.foundation.BorderStroke(1.dp, borderColor)
+    ) {
+        Row(
+            modifier = Modifier
+                .padding(horizontal = 14.dp, vertical = 12.dp)
+                .fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column {
+                Text(
+                    text = node.name,
+                    fontSize = 14.sp,
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                    color = if (isSelected) MiuixTheme.PrimaryBlue else textPrimary
+                )
+                Text(
+                    text = "协议: ${node.protocol.uppercase()} · 地区: ${node.region}",
+                    fontSize = 12.sp,
+                    color = textSecondary
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(MiuixTheme.ActiveGreen.copy(alpha = 0.15f))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    text = "${node.latencyMs} ms",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MiuixTheme.ActiveGreen
+                )
+            }
+        }
+    }
+}
+
+@Preview(name = "Light Mode", showBackground = true, widthDp = 390, heightDp = 844)
+@Composable
+fun MiuixDashboardPreviewLight() {
     MiuixDashboard(isDark = false)
 }
 
-@Preview(name = "MIUIX 暗色风格预览", uiMode = Configuration.UI_MODE_NIGHT_YES, showBackground = true, widthDp = 390, heightDp = 844)
+@Preview(name = "Dark Mode", uiMode = Configuration.UI_MODE_NIGHT_YES, showBackground = true, widthDp = 390, heightDp = 844)
 @Composable
-fun PreviewMiuixDashboardDark() {
+fun MiuixDashboardPreviewDark() {
     MiuixDashboard(isDark = true)
 }
